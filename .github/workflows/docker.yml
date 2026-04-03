@@ -6,7 +6,21 @@ on:
       - main
     tags:
       - "v*"
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+      - "go.mod"
+      - "go.sum"
+      - "**/*.go"
   pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+      - "go.mod"
+      - "go.sum"
+      - "**/*.go"
   workflow_dispatch:
 
 env:

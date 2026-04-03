@@ -35,6 +35,7 @@ example.com {
 - `anytls` 只处理 TLS 解密后的明文连接
 - 非 AnyTLS 流量会继续进入正常网站链路
 - `sp.v2.udp-over-tcp.arpa` 会作为 `UDP over TCP v2` 保留目标处理，不会按普通域名解析
+- `user <name> <password>` 里的 `name` 是本模块的运维标识，不是 AnyTLS 协议强制用户名；它主要用于日志、用户管理和审计
 - 命中已禁用用户的 AnyTLS 首包会被直接拒绝，不会回落到网站
 - 配置 reload/卸载时，现有 AnyTLS 会话会被主动终止；网站请求链路不受这条策略影响
 
