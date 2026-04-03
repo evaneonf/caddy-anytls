@@ -4,7 +4,8 @@ WORKDIR /src
 COPY . .
 
 RUN xcaddy build v2.10.2 \
-    --with github.com/evaneonf/caddy-anytls=/src
+    --with github.com/evaneonf/caddy-anytls=/src \
+    --output /usr/bin/caddy
 
 FROM caddy:2.10.2
 
