@@ -5,12 +5,15 @@ package anytls
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +21,7 @@ import (
 	"github.com/anytls/sing-anytls/padding"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
@@ -41,13 +45,14 @@ type ListenerWrapper struct {
 	AllowPrivateTargets bool           `json:"allow_private_targets,omitempty"`
 	PaddingScheme       string         `json:"padding_scheme,omitempty"`
 
-	logger   *zap.Logger
-	active   int64
-	connSeq  uint64
-	registry *sessionRegistry
-	detector Detector
-	service  *singanytls.Service
-	dialFunc func(ctx context.Context, network string, address string) (net.Conn, error)
+	logger           *zap.Logger
+	active           int64
+	connSeq          uint64
+	registry         *sessionRegistry
+	detector         Detector
+	service          *singanytls.Service
+	websiteConns     sync.Map
+	dialFunc         func(ctx context.Context, network string, address string) (net.Conn, error)
 	listenPacketFunc func(ctx context.Context, network string, address string) (net.PacketConn, error)
 }
 
@@ -90,6 +95,10 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	}
 	if lw.registry == nil {
 		lw.registry = newSessionRegistry()
+	}
+	if server, ok := ctx.Context.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && server != nil {
+		server.RegisterConnContext(lw.websiteConnContext)
+		server.RegisterConnState(lw.cleanupWebsiteConn)
 	}
 	ctx.OnCancel(func() {
 		lw.closeActiveSessions("config_unload")
@@ -440,6 +449,38 @@ func (lw *ListenerWrapper) logFallback(conn net.Conn, err error) {
 		zap.String("reason", probeFailureReason(err)),
 		zap.Error(err),
 	)
+}
+
+func (lw *ListenerWrapper) prepareWebsiteConn(conn *bufferedConn) (net.Conn, error) {
+	prefix, err := conn.BufferedBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	websiteConn := newPrependConn(conn.Conn, prefix)
+	if stater, ok := conn.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		lw.websiteConns.Store(websiteConn, tlsStateConn{
+			Conn:  websiteConn,
+			state: stater.ConnectionState(),
+		})
+	}
+
+	return websiteConn, nil
+}
+
+func (lw *ListenerWrapper) websiteConnContext(ctx context.Context, conn net.Conn) context.Context {
+	shadowConn, ok := lw.websiteConns.Load(conn)
+	if !ok {
+		return ctx
+	}
+	return context.WithValue(ctx, caddyhttp.ConnCtxKey, shadowConn)
+}
+
+func (lw *ListenerWrapper) cleanupWebsiteConn(conn net.Conn, state http.ConnState) {
+	switch state {
+	case http.StateClosed, http.StateHijacked:
+		lw.websiteConns.Delete(conn)
+	}
 }
 
 var (

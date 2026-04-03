@@ -3,12 +3,18 @@ package anytls
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
 	"io"
+	"math/big"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -20,12 +26,14 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	_ "github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
+	"golang.org/x/net/http2"
 )
 
 func TestBufferedConnPeekPreservesBytes(t *testing.T) {
@@ -72,6 +80,41 @@ func TestBufferedConnPreservesConnectionState(t *testing.T) {
 	}
 	if got.NegotiatedProtocol != expected.NegotiatedProtocol {
 		t.Fatalf("ConnectionState().NegotiatedProtocol = %q, want %q", got.NegotiatedProtocol, expected.NegotiatedProtocol)
+	}
+}
+
+func TestBufferedConnBufferedBytesPreservesBytes(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	go func() {
+		_, _ = client.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
+	}()
+
+	conn := newBufferedConn(server)
+	preview, err := conn.Peek(8, time.Second)
+	if err != nil {
+		t.Fatalf("Peek() error = %v", err)
+	}
+	if string(preview) != "PRI * HT" {
+		t.Fatalf("Peek() = %q, want %q", string(preview), "PRI * HT")
+	}
+
+	buffered, err := conn.BufferedBytes()
+	if err != nil {
+		t.Fatalf("BufferedBytes() error = %v", err)
+	}
+	if string(buffered) != "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+		t.Fatalf("BufferedBytes() = %q, want %q", string(buffered), "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+	}
+
+	buf := make([]byte, len("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("ReadFull() error = %v", err)
+	}
+	if string(buf) != "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+		t.Fatalf("read bytes = %q, want %q", string(buf), "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 	}
 }
 
@@ -182,6 +225,463 @@ func TestWebsiteFallbackEndToEnd(t *testing.T) {
 
 	if err := <-serverErr; err != nil {
 		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestHTTP2FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+
+	base := newChanListener()
+	defer base.Close()
+
+	tlsListener := tls.NewListener(base, &tls.Config{
+		Certificates: []tls.Certificate{newTestCertificate(t)},
+		NextProtos:   []string{"h2", "http/1.1"},
+	})
+	wrapped := wrapper.WrapListener(tlsListener)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := wrapped.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+
+		if _, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+			serverErr <- errors.New("wrapped listener should not expose ConnectionState on fallback connection")
+			return
+		}
+
+		ctx := wrapper.websiteConnContext(context.Background(), conn)
+		shadowConn, ok := ctx.Value(caddyhttp.ConnCtxKey).(interface{ ConnectionState() tls.ConnectionState })
+		if !ok {
+			serverErr <- errors.New("ConnContext did not expose shadow TLS connection")
+			return
+		}
+		if got := shadowConn.ConnectionState().NegotiatedProtocol; got != "h2" {
+			serverErr <- errors.New("unexpected negotiated protocol: " + got)
+			return
+		}
+
+		preface := make([]byte, len(http2.ClientPreface))
+		if _, err := io.ReadFull(conn, preface); err != nil {
+			serverErr <- err
+			return
+		}
+		if string(preface) != http2.ClientPreface {
+			serverErr <- errors.New("http2 preface was not preserved")
+			return
+		}
+
+		serverErr <- nil
+	}()
+
+	serverConn, clientConn := net.Pipe()
+	base.enqueue(serverConn)
+
+	client := tls.Client(clientConn, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2"},
+		ServerName:         "example.test",
+	})
+	defer client.Close()
+
+	if err := client.Handshake(); err != nil {
+		t.Fatalf("client Handshake() error = %v", err)
+	}
+	if got := client.ConnectionState().NegotiatedProtocol; got != "h2" {
+		t.Fatalf("client negotiated protocol = %q, want %q", got, "h2")
+	}
+	if _, err := io.WriteString(client, http2.ClientPreface); err != nil {
+		t.Fatalf("WriteString() error = %v", err)
+	}
+
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestHTTP1FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+
+	base := newChanListener()
+	defer base.Close()
+
+	tlsListener := tls.NewListener(base, &tls.Config{
+		Certificates: []tls.Certificate{newTestCertificate(t)},
+		NextProtos:   []string{"http/1.1"},
+	})
+	wrapped := wrapper.WrapListener(tlsListener)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := wrapped.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+
+		if _, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+			serverErr <- errors.New("wrapped listener should not expose ConnectionState on fallback connection")
+			return
+		}
+
+		ctx := wrapper.websiteConnContext(context.Background(), conn)
+		shadowConn, ok := ctx.Value(caddyhttp.ConnCtxKey).(interface{ ConnectionState() tls.ConnectionState })
+		if !ok {
+			serverErr <- errors.New("ConnContext did not expose shadow TLS connection")
+			return
+		}
+		if got := shadowConn.ConnectionState().NegotiatedProtocol; got != "http/1.1" {
+			serverErr <- errors.New("unexpected negotiated protocol: " + got)
+			return
+		}
+		if got := shadowConn.ConnectionState().ServerName; got != "example.test" {
+			serverErr <- errors.New("unexpected server name: " + got)
+			return
+		}
+
+		request := "GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
+		buf := make([]byte, len(request))
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			serverErr <- err
+			return
+		}
+		if string(buf) != request {
+			serverErr <- errors.New("http/1.1 request bytes were not preserved")
+			return
+		}
+
+		serverErr <- nil
+	}()
+
+	serverConn, clientConn := net.Pipe()
+	base.enqueue(serverConn)
+
+	client := tls.Client(clientConn, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"http/1.1"},
+		ServerName:         "example.test",
+	})
+	defer client.Close()
+
+	if err := client.Handshake(); err != nil {
+		t.Fatalf("client Handshake() error = %v", err)
+	}
+	if got := client.ConnectionState().NegotiatedProtocol; got != "http/1.1" {
+		t.Fatalf("client negotiated protocol = %q, want %q", got, "http/1.1")
+	}
+	if _, err := io.WriteString(client, "GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatalf("WriteString() error = %v", err)
+	}
+
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestCleanupWebsiteConnRemovesShadowState(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	buffered := newBufferedConn(testTLSStateConn{
+		Conn:  server,
+		state: tls.ConnectionState{ServerName: "example.test", NegotiatedProtocol: "h2"},
+	})
+	go func() {
+		_, _ = client.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
+	}()
+	if _, err := buffered.Peek(8, time.Second); err != nil {
+		t.Fatalf("Peek() error = %v", err)
+	}
+
+	websiteConn, err := wrapper.prepareWebsiteConn(buffered)
+	if err != nil {
+		t.Fatalf("prepareWebsiteConn() error = %v", err)
+	}
+
+	ctx := wrapper.websiteConnContext(context.Background(), websiteConn)
+	if _, ok := ctx.Value(caddyhttp.ConnCtxKey).(interface{ ConnectionState() tls.ConnectionState }); !ok {
+		t.Fatal("expected shadow TLS connection before cleanup")
+	}
+
+	wrapper.cleanupWebsiteConn(websiteConn, http.StateClosed)
+
+	ctx = wrapper.websiteConnContext(context.Background(), websiteConn)
+	if got := ctx.Value(caddyhttp.ConnCtxKey); got != nil {
+		t.Fatalf("expected shadow TLS connection to be removed, got %#v", got)
+	}
+}
+
+func TestPostTLSWrapperAfterAnyTLSFallbackLosesConnectionState(t *testing.T) {
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+
+	base := newChanListener()
+	defer base.Close()
+
+	tlsListener := tls.NewListener(base, &tls.Config{
+		Certificates: []tls.Certificate{newTestCertificate(t)},
+		NextProtos:   []string{"http/1.1"},
+	})
+	afterAnyTLS := wrapper.WrapListener(tlsListener)
+	checker := &stateCheckingListener{
+		Listener: afterAnyTLS,
+		seenCh:   make(chan net.Conn, 1),
+		errCh:    make(chan error, 1),
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := checker.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+		serverErr <- nil
+	}()
+
+	serverConn, clientConn := net.Pipe()
+	base.enqueue(serverConn)
+
+	client := tls.Client(clientConn, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"http/1.1"},
+		ServerName:         "example.test",
+	})
+	defer client.Close()
+
+	if err := client.Handshake(); err != nil {
+		t.Fatalf("client Handshake() error = %v", err)
+	}
+	if _, err := io.WriteString(client, "GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatalf("WriteString() error = %v", err)
+	}
+
+	select {
+	case err := <-checker.errCh:
+		if err == nil || err.Error() != "missing ConnectionState" {
+			t.Fatalf("checker err = %v, want missing ConnectionState", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected checker to report missing ConnectionState")
+	}
+
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestPostTLSWrapperAfterAnyTLSDoesNotSeeAnyTLSConnections(t *testing.T) {
+	destinationAddress := "service.example.internal:443"
+	destination := newChanListener()
+	defer destination.Close()
+
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+	wrapper.ProbeTimeout = caddy.Duration(time.Second)
+	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
+		if address != destinationAddress {
+			return nil, errors.New("unexpected destination address")
+		}
+		serverConn, clientConn := net.Pipe()
+		destination.enqueue(serverConn)
+		return clientConn, nil
+	}
+
+	destDone := make(chan error, 1)
+	go func() {
+		conn, err := destination.Accept()
+		if err != nil {
+			destDone <- err
+			return
+		}
+		defer conn.Close()
+
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			destDone <- err
+			return
+		}
+
+		_, err = io.WriteString(conn, strings.ToUpper(line))
+		destDone <- err
+	}()
+
+	base := newChanListener()
+	defer base.Close()
+	tlsListener := tls.NewListener(base, &tls.Config{
+		Certificates: []tls.Certificate{newTestCertificate(t)},
+		NextProtos:   []string{"h2", "http/1.1"},
+	})
+	afterAnyTLS := wrapper.WrapListener(tlsListener)
+	checker := &stateCheckingListener{
+		Listener: afterAnyTLS,
+		seenCh:   make(chan net.Conn, 1),
+		errCh:    make(chan error, 1),
+	}
+
+	acceptCtx, cancelAccept := context.WithCancel(context.Background())
+	defer cancelAccept()
+	go acceptLoop(acceptCtx, checker)
+
+	client, err := singanytls.NewClient(context.Background(), singanytls.ClientConfig{
+		Password:                 "secret",
+		IdleSessionCheckInterval: 100 * time.Millisecond,
+		IdleSessionTimeout:       time.Second,
+		MinIdleSession:           0,
+		DialOut: func(ctx context.Context) (net.Conn, error) {
+			serverConn, clientConn := net.Pipe()
+			base.enqueue(serverConn)
+
+			tlsClient := tls.Client(clientConn, &tls.Config{
+				InsecureSkipVerify: true,
+				NextProtos:         []string{"h2", "http/1.1"},
+				ServerName:         "example.test",
+			})
+			if err := tlsClient.HandshakeContext(ctx); err != nil {
+				_ = tlsClient.Close()
+				return nil, err
+			}
+			return tlsClient, nil
+		},
+		Logger: zapLogger{base: zap.NewNop()},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer client.Close()
+
+	proxyConn, err := client.CreateProxy(context.Background(), M.ParseSocksaddr(destinationAddress))
+	if err != nil {
+		t.Fatalf("CreateProxy() error = %v", err)
+	}
+	defer proxyConn.Close()
+
+	if _, err := io.WriteString(proxyConn, "hello through anytls over tls\n"); err != nil {
+		t.Fatalf("WriteString() error = %v", err)
+	}
+
+	reply, err := bufio.NewReader(proxyConn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("ReadString() error = %v", err)
+	}
+	if reply != "HELLO THROUGH ANYTLS OVER TLS\n" {
+		t.Fatalf("reply = %q, want %q", reply, "HELLO THROUGH ANYTLS OVER TLS\n")
+	}
+
+	if err := <-destDone; err != nil {
+		t.Fatalf("destination error = %v", err)
+	}
+
+	select {
+	case conn := <-checker.seenCh:
+		_ = conn.Close()
+		t.Fatal("post-TLS wrapper should not see AnyTLS connections")
+	case err := <-checker.errCh:
+		t.Fatalf("post-TLS wrapper should not see AnyTLS connections, got err %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestAnyTLSEndToEndProxyOverTLSWithH2ALPN(t *testing.T) {
+	destinationAddress := "service.example.internal:443"
+	destination := newChanListener()
+	defer destination.Close()
+
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+	wrapper.ProbeTimeout = caddy.Duration(time.Second)
+	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
+		if address != destinationAddress {
+			return nil, errors.New("unexpected destination address")
+		}
+		serverConn, clientConn := net.Pipe()
+		destination.enqueue(serverConn)
+		return clientConn, nil
+	}
+
+	destDone := make(chan error, 1)
+	go func() {
+		conn, err := destination.Accept()
+		if err != nil {
+			destDone <- err
+			return
+		}
+		defer conn.Close()
+
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			destDone <- err
+			return
+		}
+
+		_, err = io.WriteString(conn, strings.ToUpper(line))
+		destDone <- err
+	}()
+
+	base := newChanListener()
+	defer base.Close()
+	tlsListener := tls.NewListener(base, &tls.Config{
+		Certificates: []tls.Certificate{newTestCertificate(t)},
+		NextProtos:   []string{"h2", "http/1.1"},
+	})
+
+	acceptCtx, cancelAccept := context.WithCancel(context.Background())
+	defer cancelAccept()
+	go acceptLoop(acceptCtx, wrapper.WrapListener(tlsListener))
+
+	client, err := singanytls.NewClient(context.Background(), singanytls.ClientConfig{
+		Password:                 "secret",
+		IdleSessionCheckInterval: 100 * time.Millisecond,
+		IdleSessionTimeout:       time.Second,
+		MinIdleSession:           0,
+		DialOut: func(ctx context.Context) (net.Conn, error) {
+			serverConn, clientConn := net.Pipe()
+			base.enqueue(serverConn)
+
+			tlsClient := tls.Client(clientConn, &tls.Config{
+				InsecureSkipVerify: true,
+				NextProtos:         []string{"h2", "http/1.1"},
+				ServerName:         "example.test",
+			})
+			if err := tlsClient.HandshakeContext(ctx); err != nil {
+				_ = tlsClient.Close()
+				return nil, err
+			}
+			return tlsClient, nil
+		},
+		Logger: zapLogger{base: zap.NewNop()},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer client.Close()
+
+	proxyConn, err := client.CreateProxy(context.Background(), M.ParseSocksaddr(destinationAddress))
+	if err != nil {
+		t.Fatalf("CreateProxy() error = %v", err)
+	}
+	defer proxyConn.Close()
+
+	if _, err := io.WriteString(proxyConn, "hello through anytls over tls\n"); err != nil {
+		t.Fatalf("WriteString() error = %v", err)
+	}
+
+	reply, err := bufio.NewReader(proxyConn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("ReadString() error = %v", err)
+	}
+	if reply != "HELLO THROUGH ANYTLS OVER TLS\n" {
+		t.Fatalf("reply = %q, want %q", reply, "HELLO THROUGH ANYTLS OVER TLS\n")
+	}
+
+	if err := <-destDone; err != nil {
+		t.Fatalf("destination error = %v", err)
 	}
 }
 
@@ -814,6 +1314,39 @@ func newTestWrapper(t *testing.T, users []User, allowPrivateTargets bool) *Liste
 	return wrapper
 }
 
+func newTestCertificate(t *testing.T) tls.Certificate {
+	t.Helper()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey() error = %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "example.test",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		DNSNames:              []string{"example.test"},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate() error = %v", err)
+	}
+
+	return tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  privateKey,
+		Leaf:        template,
+	}
+}
+
 func acceptLoop(ctx context.Context, l net.Listener) {
 	for {
 		conn, err := l.Accept()
@@ -869,6 +1402,25 @@ func (d anyTLSTestDialer) DialContext(ctx context.Context, network string, desti
 
 func (d anyTLSTestDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	return nil, errors.New("not implemented in tests")
+}
+
+type stateCheckingListener struct {
+	net.Listener
+	seenCh chan net.Conn
+	errCh  chan error
+}
+
+func (l *stateCheckingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); !ok {
+		l.errCh <- errors.New("missing ConnectionState")
+	} else {
+		l.seenCh <- conn
+	}
+	return conn, nil
 }
 
 func newChanListener() *chanListener {

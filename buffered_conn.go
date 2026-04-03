@@ -36,6 +36,19 @@ func (bc *bufferedConn) Peek(n int, timeout time.Duration) ([]byte, error) {
 	return bc.reader.Peek(n)
 }
 
+func (bc *bufferedConn) BufferedBytes() ([]byte, error) {
+	buffered := bc.reader.Buffered()
+	if buffered == 0 {
+		return nil, nil
+	}
+
+	preview, err := bc.reader.Peek(buffered)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), preview...), nil
+}
+
 func (bc *bufferedConn) ConnectionState() tls.ConnectionState {
 	type connectionStater interface {
 		ConnectionState() tls.ConnectionState
