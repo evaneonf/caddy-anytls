@@ -14,18 +14,18 @@ xcaddy build --with github.com/evaneonf/caddy-anytls=.
 
 ```caddyfile
 {
-	servers :443 {
-		listener_wrappers {
-			anytls {
-				user phone-1 replace-with-strong-password
-				user laptop-1 replace-with-another-password
-			}
-		}
-	}
+    servers :443 {
+        listener_wrappers {
+            anytls {
+                user phone-1 replace-with-strong-password
+                user laptop-1 replace-with-another-password
+            }
+        }
+    }
 }
 
 example.com {
-	respond "server is running"
+    respond "server is running"
 }
 ```
 
@@ -43,25 +43,25 @@ example.com {
 
 ```json
 {
-  "wrapper": "anytls",
-  "probe_timeout": "5s",
-  "idle_timeout": "2m",
-  "connect_timeout": "10s",
-  "max_concurrent": 128,
-  "fallback": true,
-  "allow_private_targets": false,
-  "users": [
-    {
-      "name": "phone-1",
-      "password": "replace-with-strong-password",
-      "enabled": true
-    },
-    {
-      "name": "laptop-1",
-      "password": "replace-with-another-password",
-      "enabled": true
-    }
-  ]
+    "wrapper": "anytls",
+    "probe_timeout": "5s",
+    "idle_timeout": "2m",
+    "connect_timeout": "10s",
+    "max_concurrent": 128,
+    "fallback": true,
+    "allow_private_targets": false,
+    "users": [
+        {
+            "name": "phone-1",
+            "password": "replace-with-strong-password",
+            "enabled": true
+        },
+        {
+            "name": "laptop-1",
+            "password": "replace-with-another-password",
+            "enabled": true
+        }
+    ]
 }
 ```
 

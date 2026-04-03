@@ -112,19 +112,19 @@ listener wrapper 的 `Accept()` 负责做连接分流：
 
 ```json
 {
-  "probe_timeout": "5s",
-  "idle_timeout": "2m",
-  "connect_timeout": "10s",
-  "max_concurrent": 128,
-  "fallback": true,
-  "allow_private_targets": false,
-  "users": [
-    {
-      "name": "device-1",
-      "password": "redacted",
-      "enabled": true
-    }
-  ]
+    "probe_timeout": "5s",
+    "idle_timeout": "2m",
+    "connect_timeout": "10s",
+    "max_concurrent": 128,
+    "fallback": true,
+    "allow_private_targets": false,
+    "users": [
+        {
+            "name": "device-1",
+            "password": "redacted",
+            "enabled": true
+        }
+    ]
 }
 ```
 

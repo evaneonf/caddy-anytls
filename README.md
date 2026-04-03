@@ -72,17 +72,17 @@ docker compose up -d --build
 
 ```caddyfile
 {
-	servers :443 {
-		listener_wrappers {
-			anytls {
-				user phone-1 replace-with-strong-password
-			}
-		}
-	}
+    servers :443 {
+        listener_wrappers {
+            anytls {
+                user phone-1 replace-with-strong-password
+            }
+        }
+    }
 }
 
 example.com {
-	respond "server is running"
+    respond "server is running"
 }
 ```
 
