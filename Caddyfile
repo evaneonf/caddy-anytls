@@ -1,0 +1,14 @@
+{
+	servers :443 {
+		listener_wrappers {
+			anytls {
+				user device-1 change-this-password
+			}
+		}
+	}
+}
+
+# Replace example.com with your real domain before deploying.
+example.com {
+	respond "server is running"
+}
