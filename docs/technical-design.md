@@ -167,6 +167,8 @@ listener wrapper 的 `Accept()` 负责做连接分流：
 - `event`
 - `outcome`
 - `reason`
+- `protocol`
+- `uot_is_connect`（仅 `UDP over TCP v2`）
 - `user`
 - `source`
 - `destination`

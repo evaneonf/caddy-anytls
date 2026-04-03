@@ -3,6 +3,7 @@ package anytls
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,8 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	_ "github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -49,6 +52,26 @@ func TestBufferedConnPeekPreservesBytes(t *testing.T) {
 	}
 	if string(buf) != "GET" {
 		t.Fatalf("read bytes = %q, want %q", string(buf), "GET")
+	}
+}
+
+func TestBufferedConnPreservesConnectionState(t *testing.T) {
+	expected := tls.ConnectionState{
+		ServerName:         "example.com",
+		NegotiatedProtocol: "h2",
+	}
+
+	conn := newBufferedConn(testTLSStateConn{
+		Conn:  &net.TCPConn{},
+		state: expected,
+	})
+
+	got := conn.ConnectionState()
+	if got.ServerName != expected.ServerName {
+		t.Fatalf("ConnectionState().ServerName = %q, want %q", got.ServerName, expected.ServerName)
+	}
+	if got.NegotiatedProtocol != expected.NegotiatedProtocol {
+		t.Fatalf("ConnectionState().NegotiatedProtocol = %q, want %q", got.NegotiatedProtocol, expected.NegotiatedProtocol)
 	}
 }
 
@@ -243,6 +266,178 @@ func TestAnyTLSEndToEndProxy(t *testing.T) {
 	}
 }
 
+func TestAnyTLSEndToEndUDPOverTCP(t *testing.T) {
+	serverPacketConn, handlerPacketConn := newPacketPipe()
+	defer serverPacketConn.Close()
+	defer handlerPacketConn.Close()
+
+	udpDone := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 2048)
+		n, addr, err := serverPacketConn.ReadFrom(buffer)
+		if err != nil {
+			udpDone <- err
+			return
+		}
+		_, err = serverPacketConn.WriteTo([]byte(strings.ToUpper(string(buffer[:n]))), addr)
+		udpDone <- err
+	}()
+
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+	wrapper.listenPacketFunc = func(ctx context.Context, network string, address string) (net.PacketConn, error) {
+		return handlerPacketConn, nil
+	}
+	base := newChanListener()
+	defer base.Close()
+
+	wrapped := wrapper.WrapListener(base)
+	acceptCtx, cancelAccept := context.WithCancel(context.Background())
+	defer cancelAccept()
+	go acceptLoop(acceptCtx, wrapped)
+
+	client, err := singanytls.NewClient(context.Background(), singanytls.ClientConfig{
+		Password:                 "secret",
+		IdleSessionCheckInterval: 100 * time.Millisecond,
+		IdleSessionTimeout:       time.Second,
+		MinIdleSession:           0,
+		DialOut: func(ctx context.Context) (net.Conn, error) {
+			serverConn, clientConn := net.Pipe()
+			base.enqueue(serverConn)
+			return clientConn, nil
+		},
+		Logger: zapLogger{base: zap.NewNop()},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer client.Close()
+
+	uotClient := &uot.Client{
+		Dialer:  anyTLSTestDialer{client: client},
+		Version: uot.Version,
+	}
+
+	uotConn, err := uotClient.DialContext(context.Background(), N.NetworkUDP, M.ParseSocksaddr("1.1.1.1:53"))
+	if err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+	defer uotConn.Close()
+
+	if _, err := io.WriteString(uotConn, "hello over udp\n"); err != nil {
+		t.Fatalf("WriteString() error = %v", err)
+	}
+
+	reply, err := bufio.NewReader(uotConn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("ReadString() error = %v", err)
+	}
+	if reply != "HELLO OVER UDP\n" {
+		t.Fatalf("reply = %q, want %q", reply, "HELLO OVER UDP\n")
+	}
+
+	if err := <-udpDone; err != nil {
+		t.Fatalf("udp server error = %v", err)
+	}
+}
+
+func TestAnyTLSEndToEndUDPOverTCPDatagramMode(t *testing.T) {
+	serverPacketConn, handlerPacketConn := newPacketPipe()
+	defer serverPacketConn.Close()
+	defer handlerPacketConn.Close()
+
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 2048)
+		n, addr, err := serverPacketConn.ReadFrom(buffer)
+		if err != nil {
+			firstDone <- err
+			return
+		}
+		_, err = serverPacketConn.WriteTo([]byte(strings.ToUpper(string(buffer[:n]))), addr)
+		firstDone <- err
+	}()
+	go func() {
+		buffer := make([]byte, 2048)
+		n, addr, err := serverPacketConn.ReadFrom(buffer)
+		if err != nil {
+			secondDone <- err
+			return
+		}
+		_, err = serverPacketConn.WriteTo([]byte(strings.ToUpper(string(buffer[:n]))), addr)
+		secondDone <- err
+	}()
+
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+	wrapper.listenPacketFunc = func(ctx context.Context, network string, address string) (net.PacketConn, error) {
+		return handlerPacketConn, nil
+	}
+	base := newChanListener()
+	defer base.Close()
+
+	go acceptLoop(context.Background(), wrapper.WrapListener(base))
+
+	client, err := singanytls.NewClient(context.Background(), singanytls.ClientConfig{
+		Password:                 "secret",
+		IdleSessionCheckInterval: 100 * time.Millisecond,
+		IdleSessionTimeout:       time.Second,
+		MinIdleSession:           0,
+		DialOut: func(ctx context.Context) (net.Conn, error) {
+			serverConn, clientConn := net.Pipe()
+			base.enqueue(serverConn)
+			return clientConn, nil
+		},
+		Logger: zapLogger{base: zap.NewNop()},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer client.Close()
+
+	uotClient := &uot.Client{
+		Dialer:  anyTLSTestDialer{client: client},
+		Version: uot.Version,
+	}
+
+	packetConn, err := uotClient.ListenPacket(context.Background(), M.ParseSocksaddr("1.1.1.1:53"))
+	if err != nil {
+		t.Fatalf("ListenPacket() error = %v", err)
+	}
+	defer packetConn.Close()
+
+	dest1 := M.ParseSocksaddr("1.1.1.1:53")
+	dest2 := M.ParseSocksaddr("8.8.8.8:53")
+	if _, err := packetConn.WriteTo([]byte("first datagram"), dest1); err != nil {
+		t.Fatalf("WriteTo(dest1) error = %v", err)
+	}
+	if _, err := packetConn.WriteTo([]byte("second datagram"), dest2); err != nil {
+		t.Fatalf("WriteTo(dest2) error = %v", err)
+	}
+
+	buf := make([]byte, 2048)
+	replies := make(map[string]string, 2)
+	for i := 0; i < 2; i++ {
+		n, addr, err := packetConn.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom() error = %v", err)
+		}
+		replies[addr.String()] = string(buf[:n])
+	}
+	if replies[dest1.String()] != "FIRST DATAGRAM" {
+		t.Fatalf("reply for %s = %q, want %q", dest1.String(), replies[dest1.String()], "FIRST DATAGRAM")
+	}
+	if replies[dest2.String()] != "SECOND DATAGRAM" {
+		t.Fatalf("reply for %s = %q, want %q", dest2.String(), replies[dest2.String()], "SECOND DATAGRAM")
+	}
+
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first udp server error = %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second udp server error = %v", err)
+	}
+}
+
 func TestUnmarshalCaddyfile(t *testing.T) {
 	dispenser := caddyfile.NewTestDispenser(`
 	anytls {
@@ -424,6 +619,9 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 	}
 	if entry.FilterFieldKey("user").Len() == 0 || entry.FilterFieldKey("destination").Len() == 0 || entry.FilterFieldKey("connection_id").Len() == 0 {
 		t.Fatal("expected structured user, destination, and connection_id fields")
+	}
+	if entry.FilterFieldKey("protocol").Len() == 0 {
+		t.Fatal("expected structured protocol field")
 	}
 }
 
@@ -652,6 +850,27 @@ type chanListener struct {
 	closed chan struct{}
 }
 
+type testTLSStateConn struct {
+	net.Conn
+	state tls.ConnectionState
+}
+
+func (c testTLSStateConn) ConnectionState() tls.ConnectionState {
+	return c.state
+}
+
+type anyTLSTestDialer struct {
+	client *singanytls.Client
+}
+
+func (d anyTLSTestDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return d.client.CreateProxy(ctx, destination)
+}
+
+func (d anyTLSTestDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("not implemented in tests")
+}
+
 func newChanListener() *chanListener {
 	return &chanListener{
 		connCh: make(chan net.Conn, 16),
@@ -692,3 +911,85 @@ type dummyAddr string
 func (a dummyAddr) Network() string { return "memory" }
 
 func (a dummyAddr) String() string { return string(a) }
+
+type packetPayload struct {
+	data []byte
+	addr net.Addr
+}
+
+type packetConn struct {
+	localAddr net.Addr
+	peer      *packetConn
+	recvCh    chan packetPayload
+	closed    chan struct{}
+	once      sync.Once
+}
+
+func newPacketPipe() (*packetConn, *packetConn) {
+	left := &packetConn{
+		localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 10), Port: 10010},
+		recvCh:    make(chan packetPayload, 16),
+		closed:    make(chan struct{}),
+	}
+	right := &packetConn{
+		localAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 11), Port: 10011},
+		recvCh:    make(chan packetPayload, 16),
+		closed:    make(chan struct{}),
+	}
+	left.peer = right
+	right.peer = left
+	return left, right
+}
+
+func (c *packetConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case <-c.closed:
+		return 0, nil, net.ErrClosed
+	case payload := <-c.recvCh:
+		n := copy(p, payload.data)
+		return n, payload.addr, nil
+	}
+}
+
+func (c *packetConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	case <-c.peer.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+
+	data := append([]byte(nil), p...)
+	select {
+	case c.peer.recvCh <- packetPayload{data: data, addr: addr}:
+		return len(p), nil
+	case <-c.closed:
+		return 0, net.ErrClosed
+	case <-c.peer.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (c *packetConn) Close() error {
+	c.once.Do(func() {
+		close(c.closed)
+	})
+	return nil
+}
+
+func (c *packetConn) LocalAddr() net.Addr {
+	return c.localAddr
+}
+
+func (c *packetConn) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (c *packetConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (c *packetConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}

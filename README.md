@@ -13,6 +13,32 @@
 - 用一个域名给网站，一个域名给代理，或在同一站点入口下启用协议识别
 - 不再手工维护代理证书
 
+## 职责边界
+
+这个项目不是把所有能力都自己重写一遍，而是把几层现有能力接起来：
+
+- `Caddy`
+  负责 `443` 监听、TLS 握手、证书生命周期、HTTP 站点路由和 reload 生命周期。
+
+- `github.com/anytls/sing-anytls`
+  负责 AnyTLS 协议本身，包括用户认证、会话建立，以及把认证后的连接和目标地址交给上层 handler。
+
+- `github.com/sagernet/sing/common/uot`
+  负责 `UDP over TCP` 的协议格式和帧编解码，包括 `sp.v2.udp-over-tcp.arpa` 这样的保留目标语义。
+
+- `caddy-anytls`
+  负责把这些能力接进 Caddy：TLS 后识别、网站 fallback、AnyTLS 接管、真实出站桥接、结构化日志、会话管理和产品级行为语义。
+
+可以把调用链理解成：
+
+```text
+Caddy TLS/网站入口
+    -> caddy-anytls 做分流和产品语义
+        -> sing-anytls 做 AnyTLS 协议
+            -> uot 做 UDP-over-TCP 编解码
+                -> caddy-anytls 再负责真实出站桥接
+```
+
 ## 当前能力
 
 - 网站和 AnyTLS 共用同一个 `443`
@@ -21,6 +47,7 @@
 - 非 AnyTLS 流量回落到网站
 - 支持多用户
 - 支持基础出站转发
+- 支持 `UDP over TCP v2` 目标
 - 支持结构化审计日志
 - 支持 Caddyfile `listener_wrappers` 配置
 
@@ -90,6 +117,7 @@ example.com {
 
 - 普通 HTTPS 请求继续进入网站
 - AnyTLS 客户端流量由模块在 TLS 后接管
+- `sp.v2.udp-over-tcp.arpa` 会按 `UDP over TCP v2` 语义处理，不会被当普通 DNS 名称解析
 - 证书申请和续期仍由 Caddy 负责
 
 ## 容器发布
@@ -179,6 +207,8 @@ GitHub Actions 会在以下场景自动构建镜像：
 - `event`
 - `outcome`
 - `reason`
+- `protocol`
+- `uot_is_connect`（仅 `UDP over TCP v2`）
 - `user`
 - `source`
 - `destination`

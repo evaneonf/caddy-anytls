@@ -2,6 +2,7 @@ package anytls
 
 import (
 	"bufio"
+	"crypto/tls"
 	"net"
 	"time"
 )
@@ -33,4 +34,16 @@ func (bc *bufferedConn) Peek(n int, timeout time.Duration) ([]byte, error) {
 	}
 
 	return bc.reader.Peek(n)
+}
+
+func (bc *bufferedConn) ConnectionState() tls.ConnectionState {
+	type connectionStater interface {
+		ConnectionState() tls.ConnectionState
+	}
+
+	if conn, ok := bc.Conn.(connectionStater); ok {
+		return conn.ConnectionState()
+	}
+
+	return tls.ConnectionState{}
 }

@@ -34,6 +34,7 @@ example.com {
 - HTTPS 站点场景下，Caddy 会自动插入 TLS listener wrapper，本模块不需要手工声明 `tls`
 - `anytls` 只处理 TLS 解密后的明文连接
 - 非 AnyTLS 流量会继续进入正常网站链路
+- `sp.v2.udp-over-tcp.arpa` 会作为 `UDP over TCP v2` 保留目标处理，不会按普通域名解析
 - 命中已禁用用户的 AnyTLS 首包会被直接拒绝，不会回落到网站
 - 配置 reload/卸载时，现有 AnyTLS 会话会被主动终止；网站请求链路不受这条策略影响
 
@@ -87,6 +88,7 @@ example.com {
 ## 当前限制
 
 - 目前只支持基础用户列表、超时、并发和私网目标开关
+- 当前已支持 `UDP over TCP v2`，并覆盖 connect/datagram 两种模式的仓库内测试
 - 还没有更细的 ACL 和管理接口
 - 端到端行为已在仓库测试里覆盖“网站 fallback”和“AnyTLS 转发”两条核心链路
 - reload 语义当前是“新配置立即接管，新旧 AnyTLS 会话不并存”

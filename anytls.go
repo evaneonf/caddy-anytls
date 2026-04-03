@@ -20,6 +20,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 	"go.uber.org/zap"
 )
 
@@ -47,6 +48,7 @@ type ListenerWrapper struct {
 	detector Detector
 	service  *singanytls.Service
 	dialFunc func(ctx context.Context, network string, address string) (net.Conn, error)
+	listenPacketFunc func(ctx context.Context, network string, address string) (net.PacketConn, error)
 }
 
 // User defines one AnyTLS account.
@@ -263,19 +265,14 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 		}
 	})
 
+	if isUDPOverTCPDestination(destination) {
+		h.handleUDPOverTCP(ctx, conn, source, destination, startedAt, connectionID, closeOnce)
+		return
+	}
+
 	outbound, err := h.dialContext(ctx, destination)
 	if err != nil {
-		h.config.logger.Warn("anytls outbound dial failed",
-			zap.Uint64("connection_id", connectionID),
-			zap.String("event", "anytls_outbound"),
-			zap.String("outcome", "rejected"),
-			zap.String("reason", dialFailureReason(err)),
-			zap.String("user", userFromContext(ctx)),
-			zap.String("source", source.String()),
-			zap.String("destination", destination.String()),
-			zap.Duration("duration", time.Since(startedAt)),
-			zap.Error(err),
-		)
+		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), err)
 		closeOnce(err)
 		_ = conn.Close()
 		return
@@ -285,6 +282,7 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 		zap.Uint64("connection_id", connectionID),
 		zap.String("event", "anytls_session"),
 		zap.String("outcome", "authenticated"),
+		zap.String("protocol", "tcp"),
 		zap.String("user", userFromContext(ctx)),
 		zap.String("source", source.String()),
 		zap.String("destination", destination.String()),
@@ -293,12 +291,41 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 	relay(ctx, conn, outbound, closeOnce)
 }
 
-func (h *directTCPHandler) dialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
-	if !destination.IsValid() {
-		return nil, fmt.Errorf("%w", errInvalidDestination)
+func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, connectionID uint64, closeOnce N.CloseHandlerFunc) {
+	request, err := h.readUDPOverTCPRequest(conn, destination)
+	if err != nil {
+		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), err)
+		closeOnce(err)
+		_ = conn.Close()
+		return
 	}
-	if !h.config.AllowPrivateTargets && isPrivateDestination(destination) {
-		return nil, fmt.Errorf("%w: %s", errPrivateDestinationDenied, destination.String())
+
+	packetConn, err := h.listenPacketContext(ctx)
+	if err != nil {
+		h.logOutboundFailure(connectionID, source, request.Destination, startedAt, userFromContext(ctx), err)
+		closeOnce(err)
+		_ = conn.Close()
+		return
+	}
+
+	uotConn := uot.NewConn(conn, *request)
+	h.config.logger.Info("anytls connection established",
+		zap.Uint64("connection_id", connectionID),
+		zap.String("event", "anytls_session"),
+		zap.String("outcome", "authenticated"),
+		zap.String("protocol", "udp_over_tcp_v2"),
+		zap.Bool("uot_is_connect", request.IsConnect),
+		zap.String("user", userFromContext(ctx)),
+		zap.String("source", source.String()),
+		zap.String("destination", request.Destination.String()),
+	)
+
+	relayUDPOverTCP(ctx, uotConn, packetConn, h.validatePacketDestination, closeOnce)
+}
+
+func (h *directTCPHandler) dialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	if err := h.validateStreamDestination(destination); err != nil {
+		return nil, err
 	}
 
 	dialer := &net.Dialer{
@@ -308,6 +335,78 @@ func (h *directTCPHandler) dialContext(ctx context.Context, destination M.Socksa
 		return h.config.dialFunc(ctx, "tcp", destination.String())
 	}
 	return dialer.DialContext(ctx, "tcp", destination.String())
+}
+
+func (h *directTCPHandler) listenPacketContext(ctx context.Context) (net.PacketConn, error) {
+	if h.config.listenPacketFunc != nil {
+		return h.config.listenPacketFunc(ctx, "udp", "")
+	}
+
+	listenConfig := net.ListenConfig{}
+	return listenConfig.ListenPacket(ctx, "udp", "")
+}
+
+func (h *directTCPHandler) readUDPOverTCPRequest(conn net.Conn, destination M.Socksaddr) (*uot.Request, error) {
+	switch destination.Fqdn {
+	case uot.MagicAddress:
+		request, err := uot.ReadRequest(conn)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", errInvalidUDPOverTCPRequest, err)
+		}
+		if request.IsConnect {
+			if err := h.validatePacketDestination(request.Destination); err != nil {
+				return nil, err
+			}
+		}
+		return request, nil
+	case uot.LegacyMagicAddress:
+		return &uot.Request{}, nil
+	default:
+		return nil, fmt.Errorf("%w: %s", errUnsupportedUDPOverTCP, destination.String())
+	}
+}
+
+func (h *directTCPHandler) validateStreamDestination(destination M.Socksaddr) error {
+	if !destination.IsValid() || destination.Port == 0 {
+		return fmt.Errorf("%w", errInvalidDestination)
+	}
+	if !h.config.AllowPrivateTargets && isPrivateDestination(destination) {
+		return fmt.Errorf("%w: %s", errPrivateDestinationDenied, destination.String())
+	}
+	return nil
+}
+
+func (h *directTCPHandler) validatePacketDestination(destination M.Socksaddr) error {
+	if !destination.IsValid() || destination.Port == 0 {
+		return fmt.Errorf("%w", errInvalidDestination)
+	}
+	if !h.config.AllowPrivateTargets && isPrivateDestination(destination) {
+		return fmt.Errorf("%w: %s", errPrivateDestinationDenied, destination.String())
+	}
+	return nil
+}
+
+func (h *directTCPHandler) logOutboundFailure(connectionID uint64, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, user string, err error) {
+	protocol := "tcp"
+	if isUDPOverTCPDestination(destination) {
+		protocol = "udp_over_tcp_v2"
+	}
+	h.config.logger.Warn("anytls outbound dial failed",
+		zap.Uint64("connection_id", connectionID),
+		zap.String("event", "anytls_outbound"),
+		zap.String("outcome", "rejected"),
+		zap.String("reason", dialFailureReason(err)),
+		zap.String("protocol", protocol),
+		zap.String("user", user),
+		zap.String("source", source.String()),
+		zap.String("destination", destination.String()),
+		zap.Duration("duration", time.Since(startedAt)),
+		zap.Error(err),
+	)
+}
+
+func isUDPOverTCPDestination(destination M.Socksaddr) bool {
+	return destination.Fqdn == uot.MagicAddress || destination.Fqdn == uot.LegacyMagicAddress
 }
 
 func isPrivateDestination(destination M.Socksaddr) bool {
@@ -346,6 +445,8 @@ func (lw *ListenerWrapper) logFallback(conn net.Conn, err error) {
 var (
 	errInvalidDestination       = errors.New("invalid destination")
 	errPrivateDestinationDenied = errors.New("private destination denied")
+	errInvalidUDPOverTCPRequest = errors.New("invalid udp over tcp request")
+	errUnsupportedUDPOverTCP    = errors.New("unsupported udp over tcp")
 )
 
 func (lw *ListenerWrapper) nextConnectionID() uint64 {
@@ -371,6 +472,10 @@ func dialFailureReason(err error) string {
 		return "invalid_destination"
 	case errors.Is(err, errPrivateDestinationDenied):
 		return "private_target_denied"
+	case errors.Is(err, errInvalidUDPOverTCPRequest):
+		return "invalid_udp_over_tcp_request"
+	case errors.Is(err, errUnsupportedUDPOverTCP):
+		return "udp_over_tcp_unsupported"
 	default:
 		return "dial_failed"
 	}
