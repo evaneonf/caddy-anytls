@@ -1,101 +1,61 @@
-# Caddy AnyTLS Module
+# caddy-anytls
 
-把 AnyTLS 做成 Caddy 内的能力，让网站和代理共用 443，由 Caddy 自动管理 TLS 证书，AnyTLS 只处理 TLS 解密后的应用层数据，识别失败自动回落到网站。
+`caddy-anytls` 是一个 Caddy listener wrapper，用来把 AnyTLS 接到现有的 Caddy `443` 入口里。
 
-## 是什么
-
-这是一个 Caddy 扩展能力，不是独立代理软件。
-
-对用户来说，它应该表现为：
-
-- 继续使用 Caddy 部署网站
-- 在同一个 443 上额外启用 AnyTLS
-- 用一个域名给网站，一个域名给代理，或在同一站点入口下启用协议识别
-- 不再手工维护代理证书
-
-## 职责边界
-
-这个项目不是把所有能力都自己重写一遍，而是把几层现有能力接起来：
-
-- `Caddy`
-  负责 `443` 监听、TLS 握手、证书生命周期、HTTP 站点路由和 reload 生命周期。
-
-- `github.com/anytls/sing-anytls`
-  负责 AnyTLS 协议本身，包括用户认证、会话建立，以及把认证后的连接和目标地址交给上层 handler。
-
-- `github.com/sagernet/sing/common/uot`
-  负责 `UDP over TCP` 的协议格式和帧编解码，包括 `sp.v2.udp-over-tcp.arpa` 这样的保留目标语义。
-
-- `caddy-anytls`
-  负责把这些能力接进 Caddy：TLS 后识别、网站 fallback、AnyTLS 接管、真实出站桥接、结构化日志、会话管理和产品级行为语义。
-
-可以把调用链理解成：
-
-```text
-Caddy TLS/网站入口
-    -> caddy-anytls 做分流和产品语义
-        -> sing-anytls 做 AnyTLS 协议
-            -> uot 做 UDP-over-TCP 编解码
-                -> caddy-anytls 再负责真实出站桥接
-```
-
-## 当前能力
+它解决的是下面几件事：
 
 - 网站和 AnyTLS 共用同一个 `443`
-- TLS 和证书完全复用 Caddy 自动 HTTPS
+- TLS 握手和证书续期继续交给 Caddy
+- 非 AnyTLS 流量继续走网站，不需要额外做端口分流
+
+如果你已经在用 Caddy 托管站点，但不想再单独维护一套 AnyTLS 服务端和证书，这个项目就是为这个场景准备的。
+
+## 为什么要做这个
+
+常见的部署方式里，网站和代理往往是两套入口：
+
+- 网站占用 `443`
+- 代理另外开端口，或者自己接管 TLS
+- 证书、续期、监听和运维流程也分成两套
+
+`caddy-anytls` 的做法是把 AnyTLS 放进 Caddy 现有的连接处理链里。Caddy 继续负责 TLS 和网站路由，这个模块只在 TLS 解密之后识别 AnyTLS 首包；识别成功就接管连接，识别失败就把连接交还给网站。
+
+## 特性
+
+- 与网站共用同一个 `443` 监听端口
+- 完全复用 Caddy 自动 HTTPS 和证书管理
 - AnyTLS 识别发生在 TLS 解密之后
-- 非 AnyTLS 流量回落到网站
+- 非 AnyTLS 流量自动回落到正常网站链路
 - 支持多用户
-- 支持基础出站转发
-- 支持 `UDP over TCP v2` 目标
-- 支持结构化审计日志
-- 支持 Caddyfile `listener_wrappers` 配置
+- 支持基础 TCP 转发
+- 支持 `UDP over TCP v2`
+- 输出结构化审计日志
+- 支持在 Caddyfile 的 `listener_wrappers` 中启用
 
-## 当前行为语义
+## 工作方式
 
-- 命中已禁用用户的 AnyTLS 首包会被直接拒绝，不回落网站
-- 配置 reload / 卸载时，现有 AnyTLS 会话会被主动终止
-- 网站请求链路尽量不受上面这条策略影响
-- 默认拒绝常见私网目标地址
+可以把连接路径理解成：
+
+```text
+client
+  -> Caddy :443
+    -> TLS handshake
+      -> caddy-anytls 检测 TLS 后首包
+        -> 是 AnyTLS：进入认证和转发流程
+        -> 不是 AnyTLS：回落到网站
+```
+
+这个项目不是独立代理程序，而是 Caddy 的一个扩展模块。它不自己管理证书，也不替代 Caddy 的 HTTP 站点能力。
 
 ## 快速开始
 
-### 1. 构建
+### 1. 构建带模块的 Caddy
 
 ```sh
 xcaddy build --with github.com/evaneonf/caddy-anytls=.
 ```
 
-### 2. 构建容器镜像
-
-```sh
-docker build -t caddy-anytls:local .
-```
-
-这个镜像会把当前仓库源码编进一个自定义 `caddy` 二进制。
-
-### 3. 使用默认 Caddyfile 启动
-
-仓库已经包含一个可直接挂载的默认 [Caddyfile](Caddyfile)。
-
-在真正部署前，至少要改两处：
-
-- 把 `example.com` 改成你的真实域名
-- 把 `change-this-password` 改成强密码
-
-### 4. 使用 Docker Compose 启动
-
-```sh
-docker compose up -d --build
-```
-
-仓库已包含默认 [compose.yaml](compose.yaml)，会挂载：
-
-- `./Caddyfile -> /etc/caddy/Caddyfile`
-- `caddy_data -> /data`
-- `caddy_config -> /config`
-
-### 5. 最小 Caddyfile
+### 2. 准备最小配置
 
 ```caddyfile
 {
@@ -113,146 +73,126 @@ example.com {
 }
 ```
 
-### 6. 启动后效果
+使用前至少改两处：
 
-- 普通 HTTPS 请求继续进入网站
-- AnyTLS 客户端流量由模块在 TLS 后接管
-- `sp.v2.udp-over-tcp.arpa` 会按 `UDP over TCP v2` 语义处理，不会被当普通 DNS 名称解析
+- 把 `example.com` 换成真实域名
+- 把 `replace-with-strong-password` 换成强密码
+
+### 3. 启动后会发生什么
+
+- 普通 HTTPS 请求照常进入网站
+- AnyTLS 客户端连接会在 TLS 后被模块接管
+- `sp.v2.udp-over-tcp.arpa` 会按 `UDP over TCP v2` 保留目标处理
 - 证书申请和续期仍由 Caddy 负责
 
-## 容器发布
+## Docker
 
-仓库已包含：
+可以直接使用预先构建好的镜像：
 
-- [Dockerfile](Dockerfile)
-- [.github/workflows/docker.yml](.github/workflows/docker.yml)
+- `docker pull ghcr.io/evaneonf/caddy-anytls:latest`
+- 包地址：https://github.com/evaneonf/caddy-anytls/pkgs/container/caddy-anytls
 
-GitHub Actions 会在以下场景自动构建镜像：
+仓库也包含可直接使用的 [Dockerfile](Dockerfile)、[compose.yaml](compose.yaml) 和默认 [Caddyfile](Caddyfile)。
 
-- push 到 `main`
-- push `v*` tag
-- 手工触发 `workflow_dispatch`
+本地构建镜像：
 
-镜像会发布到：
+```sh
+docker build -t caddy-anytls:local .
+```
 
-- `ghcr.io/<owner>/<repo>`
+使用 Compose 启动：
 
-常见 tag 规则：
+```sh
+docker compose up -d --build
+```
 
-- `main`
-- `latest`（默认分支）
-- Git tag 名称，例如 `v0.1.0`
+默认会挂载：
 
-发布架构：
+- `./Caddyfile -> /etc/caddy/Caddyfile`
+- `caddy_data -> /data`
+- `caddy_config -> /config`
 
-- `linux/amd64`
-- `linux/arm64`
+## 配置
 
-## 配置项
+大多数场景下，最小必需配置只有两项：
 
-- 最小必需配置通常只有：
-  - 站点域名
-  - 至少一个 `user <name> <password>`
+- 站点域名
+- 至少一个 `user <name> <password>`
 
-其余参数都可以先省略，模块会使用默认值。
+### Caddyfile
 
-这里的 `name` 是本项目的运维标识，不是 AnyTLS 协议本身强制要求的用户名字段。
-它的作用主要是：
+目前支持的主要配置项如下：
 
-- 区分不同设备或客户端
-- 支持单用户禁用、移除和配置变更
-- 在结构化日志里标识连接归属
-- 为后续用户级审计、限额和统计预留稳定标识
+| 配置项                   | 默认值               | 说明                       |
+| ------------------------ | -------------------- | -------------------------- |
+| `probe_timeout`          | `5s`                 | TLS 后首包探测超时         |
+| `idle_timeout`           | `2m`                 | AnyTLS 会话空闲超时        |
+| `connect_timeout`        | `10s`                | 出站拨号超时               |
+| `max_concurrent`         | `128`                | 最大并发 AnyTLS 会话数     |
+| `fallback`               | `true`               | 非 AnyTLS 流量是否回落网站 |
+| `allow_private_targets`  | `false`              | 是否允许访问常见私网目标   |
+| `padding_scheme`         | `sing-anytls` 默认值 | AnyTLS padding 策略        |
+| `user <name> <password>` | 无                   | 添加一个启用状态的用户     |
 
-也就是说，协议认证本身主要仍依赖密码；`name` 是这个 Caddy 模块为了多用户管理额外引入的控制面字段。
+`name` 是这个模块里的运维标识，不是协议层强制字段。它主要用于区分设备、管理用户和标记日志。
 
-当前默认值来源有两类：
+### JSON
 
-- 模块自身在 `Provision()` 中设置的默认值
-- 上游 `sing-anytls` 直接提供的协议默认值
+如果你使用 JSON 配置，模块挂在 HTTP server 的 `listener_wrappers` 下：
 
-默认值如下：
+```json
+{
+  "wrapper": "anytls",
+  "probe_timeout": "5s",
+  "idle_timeout": "2m",
+  "connect_timeout": "10s",
+  "max_concurrent": 128,
+  "fallback": true,
+  "allow_private_targets": false,
+  "users": [
+    {
+      "name": "phone-1",
+      "password": "replace-with-strong-password",
+      "enabled": true
+    }
+  ]
+}
+```
 
-- `probe_timeout = 5s`
-  来源：模块默认值
-  理由：给 TLS 后首包探测留足够余量，首版偏保守
+## 当前行为
 
-- `idle_timeout = 2m`
-  来源：模块默认值
-  理由：避免空闲代理会话长期占用资源，同时不至于过短
+下面这些行为是当前版本明确成立的：
 
-- `connect_timeout = 10s`
-  来源：模块默认值
-  理由：作为出站拨号超时较稳妥，失败时也不会拖太久
+- 已禁用用户命中 AnyTLS 首包时会被直接拒绝，不会回落到网站
+- 配置 `reload` 或卸载时，现有 AnyTLS 会话会被主动终止
+- 网站请求链路尽量不受上面这条策略影响
+- 默认拒绝常见私网目标地址
 
-- `max_concurrent = 128`
-  来源：模块默认值
-  理由：首版给中小规模部署一个保守上限，防止无限制占用资源
+## 日志
 
-- `fallback = true`
-  来源：模块默认值
-  理由：符合“网站和 AnyTLS 共存”的产品目标
-
-- `allow_private_targets = false`
-  来源：Go 零值和模块行为
-  理由：默认拒绝常见私网目标，优先保证安全边界
-
-- `padding_scheme = sing-anytls default`
-  来源：上游 `sing-anytls/padding.DefaultPaddingScheme`
-  理由：直接复用协议实现的默认 padding，优先保证兼容性
-
-- `probe_timeout`: 首包探测超时
-- `idle_timeout`: AnyTLS 会话空闲超时
-- `connect_timeout`: 出站拨号超时
-- `max_concurrent`: 最大并发 AnyTLS 会话数
-- `fallback`: 是否允许非 AnyTLS 流量回落网站
-- `allow_private_targets`: 是否允许访问常见私网目标
-- `user <name> <password>`: 添加一个启用状态的 AnyTLS 用户
-
-## 审计日志
-
-当前日志会输出这些结构化字段：
+当前会输出结构化审计字段，包括：
 
 - `connection_id`
 - `event`
 - `outcome`
 - `reason`
 - `protocol`
-- `uot_is_connect`（仅 `UDP over TCP v2`）
+- `uot_is_connect`
 - `user`
 - `source`
 - `destination`
 - `duration`
 
-典型事件包括：
-
-- AnyTLS 会话认证成功
-- 非 AnyTLS 流量回落网站
-- 已禁用用户命中后拒绝
-- 私网目标拒绝
-- 配置卸载导致的会话终止
-
-## 适用边界
-
-- 这是首版实现，不是完整的策略网关
-- 当前不包含更细粒度 ACL
-- 当前没有管理接口和指标导出
-- 旧 AnyTLS 会话不会跨配置代际保活
+典型事件包括认证成功、网站 fallback、禁用用户拒绝、私网目标拒绝，以及配置卸载导致的会话终止。
 
 ## 文档
 
-- 详细产品文档见 [docs/product.md](docs/product.md)
+- 产品说明见 [docs/product.md](docs/product.md)
 - 技术设计见 [docs/technical-design.md](docs/technical-design.md)
 - 容器说明见 [docs/container.md](docs/container.md)
 - 配置示例见 [docs/examples.md](docs/examples.md)
 - 发布说明见 [docs/release.md](docs/release.md)
 
-## 许可证
+## License
 
-本项目按 `GPL-3.0-or-later` 分发。
-
-原因：
-
-- 当前实现直接集成 `github.com/anytls/sing-anytls`
-- 上游 `sing-anytls` 的 `LICENSE` 原文为 GPL-3.0-or-later
-- 本项目作为链接并分发该依赖的 Caddy 模块，需要采用与其兼容的许可证策略
+本项目采用 `GPL-3.0-or-later`。
