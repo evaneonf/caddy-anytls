@@ -35,6 +35,8 @@ client
 
 ### 1. 准备 Caddyfile
 
+创建 `config` 目录，并将下面的配置保存为 `config/Caddyfile`：
+
 ```caddyfile
 {
     servers :443 {
@@ -63,15 +65,16 @@ example.com {
 ```sh
 docker pull ghcr.io/evaneonf/caddy-anytls:latest
 
-docker run -d --name caddy-anytls \
+docker run -d --name caddy \
   -p 80:80 \
   -p 443:443 \
-  -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
+  -v "$PWD/config:/etc/caddy:ro" \
   -v caddy_data:/data \
-  -v caddy_config:/config \
   --restart unless-stopped \
   ghcr.io/evaneonf/caddy-anytls:latest
 ```
+
+`config/Caddyfile` 是需要手动维护的配置文件；`caddy_data` 是 Docker 命名卷，用于持久化证书、私钥等重要运行数据。
 
 ### 3. 确认服务
 
@@ -79,8 +82,23 @@ docker run -d --name caddy-anytls \
 
 ```sh
 curl -I https://example.com
-docker logs caddy-anytls
+docker logs caddy
 ```
+
+修改 `config/Caddyfile` 后，可以先检查配置，再让 Caddy 热重载：
+
+```sh
+docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+```
+
+默认的 `latest` 与版本标签只包含 `caddy-anytls`。需要使用 WireGuard 出站时，请改用额外包含 `caddy-wireguard` 的预构建变体：
+
+```sh
+docker pull ghcr.io/evaneonf/caddy-anytls:wireguard
+```
+
+正式版本也提供对应标签，例如 `vX.Y.Z-wireguard`。WireGuard 变体不会替换精简的默认镜像。
 
 ## 本地构建
 
@@ -95,12 +113,6 @@ xcaddy build --with github.com/evaneonf/caddy-anytls=.
 ```sh
 docker compose up -d --build
 ```
-
-Compose 默认挂载：
-
-- `./Caddyfile -> /etc/caddy/Caddyfile`
-- `caddy_data -> /data`
-- `caddy_config -> /config`
 
 ## 生产配置示例
 
@@ -246,10 +258,18 @@ anytls {
 - 推荐在全局块集中配置 WireGuard 隧道，再在 `anytls` 中通过 `tunnel <name>` 引用；这也允许 `reverse_proxy` 等其它模块安全共享同一个 device。
 - WireGuard 出站是一个独立仓库 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard)，用户态实现（wireguard-go + netstack），无需内核模块、TUN 设备或 root。构建方式：
 
+预构建镜像：
+
+```sh
+docker pull ghcr.io/evaneonf/caddy-anytls:wireguard
+```
+
+或自行构建：
+
 ```sh
 xcaddy build \
     --with github.com/evaneonf/caddy-anytls \
-    --with github.com/lihuaye/caddy-wireguard
+    --with github.com/lihuaye/caddy-wireguard@v0.1.0
 ```
 
 配置项、密钥生成和家宽侧准备见该仓库的 README。

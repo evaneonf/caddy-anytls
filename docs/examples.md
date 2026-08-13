@@ -206,12 +206,18 @@ URI 规则：
 
 默认情况下认证后的目标流量从运行 Caddy 的机器直接发出。若希望出口流量从另一台主机（例如家宽服务器）出网，可用 `outbound` 指令切换出站模块。
 
-先按同时包含主模块和 WireGuard 出站插件的方式构建（WireGuard 出站是独立仓库 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard)）：
+可以直接使用同时包含主模块和 WireGuard 出站插件的预构建镜像（WireGuard 出站是独立仓库 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard)）：
+
+```sh
+docker pull ghcr.io/evaneonf/caddy-anytls:wireguard
+```
+
+也可以自行构建：
 
 ```sh
 xcaddy build \
     --with github.com/evaneonf/caddy-anytls \
-    --with github.com/lihuaye/caddy-wireguard
+    --with github.com/lihuaye/caddy-wireguard@v0.1.0
 ```
 
 WireGuard 的密钥、端点、地址和 DNS 属于出口资源，先在全局块中定义命名隧道；`anytls` 只引用它：

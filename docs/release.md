@@ -38,6 +38,8 @@
 - 确认 `staticcheck ./...` 通过
 - 确认 `golangci-lint run` 通过
 - 确认 `go mod verify` 通过
+- 确认 `core` 与 `wireguard` Docker targets 都能构建
+- 确认 WireGuard 镜像包含 `caddy.listeners.anytls.outbounds.wireguard`，并能适配测试 Caddyfile
 - 确认许可证文件与仓库说明一致
 - 确认文档没有承诺当前尚未实现的能力
 
