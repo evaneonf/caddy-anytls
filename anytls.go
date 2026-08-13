@@ -11,10 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"net/netip"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -87,7 +85,6 @@ type ListenerWrapper struct {
 	registry            *sessionRegistry
 	detector            Detector
 	service             *singanytls.Service
-	websiteConns        sync.Map
 	allowCIDRPrefixes   []netip.Prefix
 	denyCIDRPrefixes    []netip.Prefix
 	dialFunc            func(ctx context.Context, network string, address string) (net.Conn, error)
@@ -150,8 +147,6 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	var server *caddyhttp.Server
 	if serverFromContext, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && serverFromContext != nil {
 		server = serverFromContext
-		server.RegisterConnContext(lw.websiteConnContext)
-		server.RegisterConnState(lw.cleanupWebsiteConn)
 	}
 	if err := lw.compileCIDRPolicies(); err != nil {
 		return err
@@ -399,28 +394,13 @@ func (lw *ListenerWrapper) prepareWebsiteConn(conn *bufferedConn) (net.Conn, err
 
 	websiteConn := newPrependConn(conn.Conn, prefix)
 	if stater, ok := conn.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
-		lw.websiteConns.Store(websiteConn, tlsStateConn{
+		return tlsStateConn{
 			Conn:  websiteConn,
 			state: stater.ConnectionState(),
-		})
+		}, nil
 	}
 
 	return websiteConn, nil
-}
-
-func (lw *ListenerWrapper) websiteConnContext(ctx context.Context, conn net.Conn) context.Context {
-	shadowConn, ok := lw.websiteConns.Load(conn)
-	if !ok {
-		return ctx
-	}
-	return context.WithValue(ctx, caddyhttp.ConnCtxKey, shadowConn)
-}
-
-func (lw *ListenerWrapper) cleanupWebsiteConn(conn net.Conn, state http.ConnState) {
-	switch state {
-	case http.StateClosed, http.StateHijacked:
-		lw.websiteConns.Delete(conn)
-	}
 }
 
 var (

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +16,6 @@ import (
 
 	singanytls "github.com/anytls/sing-anytls"
 	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
@@ -414,7 +412,7 @@ func TestWebsiteFallbackEndToEnd(t *testing.T) {
 	}
 }
 
-func TestHTTP2FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
+func TestHTTP2FallbackPreservesConnectionState(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
 
 	base := newChanListener()
@@ -435,18 +433,12 @@ func TestHTTP2FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
 		}
 		defer closeTest(conn)
 
-		if _, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
-			serverErr <- errors.New("wrapped listener should not expose ConnectionState on fallback connection")
-			return
-		}
-
-		ctx := wrapper.websiteConnContext(context.Background(), conn)
-		shadowConn, ok := ctx.Value(caddyhttp.ConnCtxKey).(interface{ ConnectionState() tls.ConnectionState })
+		stater, ok := conn.(interface{ ConnectionState() tls.ConnectionState })
 		if !ok {
-			serverErr <- errors.New("ConnContext did not expose shadow TLS connection")
+			serverErr <- errors.New("wrapped listener did not preserve ConnectionState on fallback connection")
 			return
 		}
-		if got := shadowConn.ConnectionState().NegotiatedProtocol; got != "h2" {
+		if got := stater.ConnectionState().NegotiatedProtocol; got != "h2" {
 			serverErr <- errors.New("unexpected negotiated protocol: " + got)
 			return
 		}
@@ -509,7 +501,7 @@ func TestHTTP2PrefaceFallsBackWithoutFullAnyTLSPeek(t *testing.T) {
 	}
 }
 
-func TestHTTP1FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
+func TestHTTP1FallbackPreservesConnectionState(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
 
 	base := newChanListener()
@@ -530,22 +522,17 @@ func TestHTTP1FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
 		}
 		defer closeTest(conn)
 
-		if _, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
-			serverErr <- errors.New("wrapped listener should not expose ConnectionState on fallback connection")
-			return
-		}
-
-		ctx := wrapper.websiteConnContext(context.Background(), conn)
-		shadowConn, ok := ctx.Value(caddyhttp.ConnCtxKey).(interface{ ConnectionState() tls.ConnectionState })
+		stater, ok := conn.(interface{ ConnectionState() tls.ConnectionState })
 		if !ok {
-			serverErr <- errors.New("ConnContext did not expose shadow TLS connection")
+			serverErr <- errors.New("wrapped listener did not preserve ConnectionState on fallback connection")
 			return
 		}
-		if got := shadowConn.ConnectionState().NegotiatedProtocol; got != "http/1.1" {
+		state := stater.ConnectionState()
+		if got := state.NegotiatedProtocol; got != "http/1.1" {
 			serverErr <- errors.New("unexpected negotiated protocol: " + got)
 			return
 		}
-		if got := shadowConn.ConnectionState().ServerName; got != "example.test" {
+		if got := state.ServerName; got != "example.test" {
 			serverErr <- errors.New("unexpected server name: " + got)
 			return
 		}
@@ -589,21 +576,18 @@ func TestHTTP1FallbackUsesOpaqueConnAndShadowTLSState(t *testing.T) {
 	}
 }
 
-func TestCleanupWebsiteConnRemovesShadowState(t *testing.T) {
+func TestWebsiteFallbackWithoutTLSStateRemainsOpaque(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
 
 	server, client := net.Pipe()
 	defer closeTest(server)
 	defer closeTest(client)
 
-	buffered := newBufferedConn(testTLSStateConn{
-		Conn:  server,
-		state: tls.ConnectionState{ServerName: "example.test", NegotiatedProtocol: "h2"},
-	})
+	buffered := newBufferedConn(server)
 	go func() {
-		_, _ = client.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))
+		_, _ = client.Write([]byte("GET / HTTP/1.1\r\n"))
 	}()
-	if _, err := buffered.Peek(8, time.Second); err != nil {
+	if _, err := buffered.Peek(1, time.Second); err != nil {
 		t.Fatalf("Peek() error = %v", err)
 	}
 
@@ -612,20 +596,12 @@ func TestCleanupWebsiteConnRemovesShadowState(t *testing.T) {
 		t.Fatalf("prepareWebsiteConn() error = %v", err)
 	}
 
-	ctx := wrapper.websiteConnContext(context.Background(), websiteConn)
-	if _, ok := ctx.Value(caddyhttp.ConnCtxKey).(interface{ ConnectionState() tls.ConnectionState }); !ok {
-		t.Fatal("expected shadow TLS connection before cleanup")
-	}
-
-	wrapper.cleanupWebsiteConn(websiteConn, http.StateClosed)
-
-	ctx = wrapper.websiteConnContext(context.Background(), websiteConn)
-	if got := ctx.Value(caddyhttp.ConnCtxKey); got != nil {
-		t.Fatalf("expected shadow TLS connection to be removed, got %#v", got)
+	if _, ok := websiteConn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		t.Fatal("non-TLS fallback connection unexpectedly implements ConnectionState")
 	}
 }
 
-func TestPostTLSWrapperAfterAnyTLSFallbackLosesConnectionState(t *testing.T) {
+func TestPostTLSWrapperAfterAnyTLSFallbackPreservesConnectionState(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
 
 	base := newChanListener()
@@ -671,12 +647,11 @@ func TestPostTLSWrapperAfterAnyTLSFallbackLosesConnectionState(t *testing.T) {
 	}
 
 	select {
+	case <-checker.seenCh:
 	case err := <-checker.errCh:
-		if err == nil || err.Error() != "missing ConnectionState" {
-			t.Fatalf("checker err = %v, want missing ConnectionState", err)
-		}
+		t.Fatalf("checker reported missing ConnectionState: %v", err)
 	case <-time.After(time.Second):
-		t.Fatal("expected checker to report missing ConnectionState")
+		t.Fatal("post-TLS wrapper did not observe fallback connection")
 	}
 
 	if err := <-serverErr; err != nil {
