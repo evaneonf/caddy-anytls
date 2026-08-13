@@ -2,68 +2,106 @@ package anytls
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net"
-	"net/netip"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
-// Outbound establishes the server-side connections used to reach AnyTLS
-// targets after authentication. The built-in "direct" outbound dials from the
-// local network stack. External modules can register under the
-// caddy.listeners.anytls.outbounds namespace to route egress traffic elsewhere
-// (for example through a WireGuard tunnel to another exit host).
+// PacketConn is the packet-oriented connection returned by a StreamOutbound.
+// Unlike net.PacketConn, destinations remain M.Socksaddr values, so an
+// outbound can receive a domain name without the AnyTLS relay resolving it on
+// the host first.
 //
-// Domain resolution is performed by the selected outbound and returned to the
-// wrapper for private-target and CIDR policy checks before dialing. This keeps
-// DNS and target traffic on the same egress path without weakening policy
-// enforcement.
-//
-// Contract for implementers:
-//
-//   - All methods are called concurrently from many handler goroutines (one
-//     per AnyTLS connection); implementations must be safe for concurrent use.
-//   - Every returned net.Conn / net.PacketConn is owned and closed by the
-//     relay. Return a dedicated connection per call; never hand out shared or
-//     cached connections.
-//   - ctx carries the dial deadline and cancellation (connect_timeout);
-//     honor it during connection establishment.
-type Outbound interface {
-	// LookupNetIP resolves host through this outbound. Tunnel outbounds must
-	// send the DNS request through the tunnel rather than using the Caddy
-	// host's resolver. network follows net.Resolver.LookupNetIP semantics.
-	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
-	// DialContext opens a stream connection to address for the given network
-	// (always "tcp" for AnyTLS TCP targets). The address is an already-resolved
-	// "ip:port" returned by LookupNetIP and checked by the wrapper.
-	DialContext(ctx context.Context, network, address string) (net.Conn, error)
-	// ListenPacket opens a packet connection used for UDP-over-TCP relaying.
-	// network is "udp" and address is empty to request an ephemeral socket.
-	// The returned connection is used unconnected: the relay calls WriteTo
-	// with arbitrary already-resolved UDP destinations, so it must support
-	// sending to any address reachable through the outbound.
-	ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error)
+// ReadPacket and WritePacket are called concurrently by the two relay
+// directions. Implementations must not retain p after either method returns.
+type PacketConn interface {
+	ReadPacket(p []byte) (n int, source M.Socksaddr, err error)
+	WritePacket(p []byte, destination M.Socksaddr) error
+	Close() error
 }
 
-// Reserved outbound names that must not be declared under "outbounds".
-// "direct" always resolves to the built-in DirectOutbound and can be
-// referenced without a declaration. "default" is the log sentinel for the
-// legacy unnamed single "outbound" default tier and is kept reserved so the
-// sentinel can never collide with a declared name.
-const (
-	reservedOutboundDirect  = "direct"
-	reservedOutboundDefault = "default"
-)
+// Outbound handles one authenticated AnyTLS session. Stream-based outbounds
+// call session.ServeLocal to let this server decode the session and dispatch
+// its individual targets. Session-based outbounds can instead relay the intact
+// AnyTLS protocol stream to another server.
+type Outbound interface {
+	HandleSession(ctx context.Context, session *OutboundSession) error
+}
+
+// StreamOutbound establishes the target connections used after an AnyTLS
+// session is decoded locally. Implementations own all target resolution and
+// routing decisions; unresolved domains are passed through unchanged.
+type StreamOutbound interface {
+	DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error)
+	OpenPacket(ctx context.Context) (PacketConn, error)
+}
+
+// OutboundSession describes one authenticated AnyTLS session selected for an
+// outbound. Its protocol bytes have only been peeked, not consumed.
+type OutboundSession struct {
+	conn           net.Conn
+	user           string
+	source         M.Socksaddr
+	connectTimeout time.Duration
+	serveLocal     func(StreamOutbound) error
+}
+
+func newOutboundSession(conn net.Conn, user string, source M.Socksaddr, connectTimeout time.Duration, serveLocal func(StreamOutbound) error) *OutboundSession {
+	return &OutboundSession{
+		conn:           conn,
+		user:           user,
+		source:         source,
+		connectTimeout: connectTimeout,
+		serveLocal:     serveLocal,
+	}
+}
+
+// Connection returns the decrypted AnyTLS protocol connection. Callers that
+// relay it must preserve all bytes after the 32-byte authentication hash.
+func (s *OutboundSession) Connection() net.Conn { return s.conn }
+
+// User returns the locally authenticated user name.
+func (s *OutboundSession) User() string { return s.user }
+
+// Source returns the client address observed by this server.
+func (s *OutboundSession) Source() M.Socksaddr { return s.source }
+
+// ConnectTimeout returns the configured timeout for establishing an outbound
+// connection. It does not limit the lifetime of an established session.
+func (s *OutboundSession) ConnectTimeout() time.Duration { return s.connectTimeout }
+
+// ServeLocal decodes this session locally and sends its streams through the
+// provided target-level outbound.
+func (s *OutboundSession) ServeLocal(outbound StreamOutbound) error {
+	if s.serveLocal == nil {
+		return errors.New("local AnyTLS session handler is unavailable")
+	}
+	return s.serveLocal(outbound)
+}
+
+// reservedOutboundDirect always refers to the zero-configuration built-in
+// direct outbound and cannot be redeclared.
+const reservedOutboundDirect = "direct"
 
 func init() {
 	caddy.RegisterModule(&DirectOutbound{})
 }
 
-// DirectOutbound dials targets directly from the local network stack. It is the
-// default when no outbound is configured and preserves the original egress
-// behaviour of the wrapper.
+// DirectOutbound reaches targets through the host network stack. It is the
+// default when no outbound is configured.
 type DirectOutbound struct{}
+
+// HandleSession lets the local AnyTLS service decode the session and dispatch
+// each stream through the host network stack.
+func (o *DirectOutbound) HandleSession(_ context.Context, session *OutboundSession) error {
+	return session.ServeLocal(o)
+}
 
 // CaddyModule returns the Caddy module information.
 func (*DirectOutbound) CaddyModule() caddy.ModuleInfo {
@@ -73,30 +111,76 @@ func (*DirectOutbound) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// LookupNetIP resolves host using the Caddy host's resolver. This is correct
-// for the direct outbound because DNS and target traffic use the same local
-// egress path.
-func (*DirectOutbound) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
-	return net.DefaultResolver.LookupNetIP(ctx, network, host)
-}
-
-// DialContext dials directly using the default dialer. The caller is
-// responsible for any connect timeout via ctx.
-func (*DirectOutbound) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+// DialContext dials a TCP target directly. net.Dialer delegates domain
+// resolution to the host resolver.
+func (*DirectOutbound) DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	if err := validateDestination(destination); err != nil {
+		return nil, err
+	}
 	var dialer net.Dialer
-	return dialer.DialContext(ctx, network, address)
+	return dialer.DialContext(ctx, "tcp", destination.String())
 }
 
-// ListenPacket opens a local UDP socket for UDP-over-TCP relaying.
-func (*DirectOutbound) ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
+// OpenPacket opens an unconnected host UDP socket. Domain targets are resolved
+// by the host resolver when their datagram is sent; no project-level DNS cache
+// is maintained.
+func (*DirectOutbound) OpenPacket(ctx context.Context) (PacketConn, error) {
 	var listenConfig net.ListenConfig
-	return listenConfig.ListenPacket(ctx, network, address)
+	conn, err := listenConfig.ListenPacket(ctx, "udp", "")
+	if err != nil {
+		return nil, err
+	}
+	return &directPacketConn{PacketConn: conn}, nil
 }
 
-// UnmarshalCaddyfile accepts the bare directive and rejects any options, for
-// symmetry with outbounds that do take configuration.
+type directPacketConn struct {
+	net.PacketConn
+}
+
+func (c *directPacketConn) ReadPacket(p []byte) (int, M.Socksaddr, error) {
+	n, source, err := c.ReadFrom(p)
+	if err != nil {
+		return 0, M.Socksaddr{}, err
+	}
+	return n, M.SocksaddrFromNet(source).Unwrap(), nil
+}
+
+func (c *directPacketConn) WritePacket(p []byte, destination M.Socksaddr) error {
+	if err := validateDestination(destination); err != nil {
+		return err
+	}
+
+	var address net.Addr
+	if destination.Addr.IsValid() {
+		address = destination.UDPAddr()
+	} else {
+		resolved, err := net.ResolveUDPAddr("udp", destination.String())
+		if err != nil {
+			return fmt.Errorf("resolve UDP target %s: %w", destination, err)
+		}
+		address = resolved
+	}
+
+	n, err := c.WriteTo(p, address)
+	if err != nil {
+		return err
+	}
+	if n != len(p) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func validateDestination(destination M.Socksaddr) error {
+	if !destination.IsValid() || destination.Port == 0 {
+		return fmt.Errorf("%w: %s", errInvalidDestination, destination.String())
+	}
+	return nil
+}
+
+// UnmarshalCaddyfile accepts the bare directive and rejects any options.
 func (*DirectOutbound) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	d.Next() // consume the outbound name
+	d.Next()
 	if d.NextArg() {
 		return d.ArgErr()
 	}
@@ -108,6 +192,8 @@ func (*DirectOutbound) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 var (
 	_ Outbound              = (*DirectOutbound)(nil)
+	_ StreamOutbound        = (*DirectOutbound)(nil)
+	_ PacketConn            = (*directPacketConn)(nil)
 	_ caddy.Module          = (*DirectOutbound)(nil)
 	_ caddyfile.Unmarshaler = (*DirectOutbound)(nil)
 )

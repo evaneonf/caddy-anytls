@@ -16,6 +16,7 @@ import (
 
 	singanytls "github.com/anytls/sing-anytls"
 	"github.com/caddyserver/caddy/v2"
+	B "github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
@@ -175,7 +176,7 @@ func TestValidate(t *testing.T) {
 }
 
 func TestWrappedListenerDoesNotBlockAcceptOnSlowProbe(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 	wrapper.ProbeTimeout = caddy.Duration(time.Second)
 	wrapper.MaxPendingProbes = 2
 	base := newChanListener()
@@ -222,7 +223,7 @@ func TestWrappedListenerDoesNotBlockAcceptOnSlowProbe(t *testing.T) {
 }
 
 func TestStreamLimits(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 	wrapper.MaxStreamsPerSession = 1
 	wrapper.MaxConcurrentStreams = 1
 	server, client := net.Pipe()
@@ -284,7 +285,7 @@ func TestHandlerReportsHandshakeSuccess(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+			wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 			tt.setup(t, wrapper)
 
 			serverConn, clientConn := net.Pipe()
@@ -298,7 +299,7 @@ func TestHandlerReportsHandshakeSuccess(t *testing.T) {
 			defer wrapper.unregisterSession(1)
 
 			closed := make(chan error, 1)
-			handler := &directTCPHandler{config: wrapper}
+			handler := &proxyHandler{config: wrapper}
 			handler.NewConnectionEx(ctx, reportingConn, M.ParseSocksaddr("192.0.2.10:12345"), tt.destination, func(err error) {
 				closed <- err
 			})
@@ -336,15 +337,16 @@ func TestHandlerReportsHandshakeSuccess(t *testing.T) {
 
 func setupHandshakeSuccessTCP(t *testing.T, wrapper *ListenerWrapper) {
 	t.Helper()
-	wrapper.resolveFunc = resolveTestDomain
 	targetConn, targetPeer := net.Pipe()
 	t.Cleanup(func() {
 		closeTest(targetConn)
 		closeTest(targetPeer)
 	})
-	wrapper.dialFunc = func(context.Context, string, string) (net.Conn, error) {
-		return targetConn, nil
-	}
+	wrapper.defaultSelection = outboundSelection{outbound: &testOutbound{
+		dial: func(context.Context, M.Socksaddr) (net.Conn, error) {
+			return targetConn, nil
+		},
+	}, name: "test"}
 }
 
 func setupHandshakeSuccessUDP(t *testing.T, wrapper *ListenerWrapper) {
@@ -354,13 +356,15 @@ func setupHandshakeSuccessUDP(t *testing.T, wrapper *ListenerWrapper) {
 		closeTest(packetConn)
 		closeTest(packetPeer)
 	})
-	wrapper.listenPacketFunc = func(context.Context, string, string) (net.PacketConn, error) {
-		return packetConn, nil
-	}
+	wrapper.defaultSelection = outboundSelection{outbound: &testOutbound{
+		open: func(context.Context) (PacketConn, error) {
+			return &packetConnAdapter{PacketConn: packetConn}, nil
+		},
+	}, name: "test"}
 }
 
 func TestWebsiteFallbackEndToEnd(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 
 	base := newChanListener()
 	defer closeTest(base)
@@ -413,7 +417,7 @@ func TestWebsiteFallbackEndToEnd(t *testing.T) {
 }
 
 func TestHTTP2FallbackPreservesConnectionState(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 
 	base := newChanListener()
 	defer closeTest(base)
@@ -482,7 +486,7 @@ func TestHTTP2FallbackPreservesConnectionState(t *testing.T) {
 }
 
 func TestHTTP2PrefaceFallsBackWithoutFullAnyTLSPeek(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 	wrapped := &wrappedListener{config: wrapper}
 
 	server, client := net.Pipe()
@@ -496,13 +500,13 @@ func TestHTTP2PrefaceFallsBackWithoutFullAnyTLSPeek(t *testing.T) {
 	if err != nil {
 		t.Fatalf("classifyBufferedConn() error = %v", err)
 	}
-	if decision != DecisionFallback {
+	if decision != routeFallback {
 		t.Fatalf("decision = %v, want fallback", decision)
 	}
 }
 
 func TestHTTP1FallbackPreservesConnectionState(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 
 	base := newChanListener()
 	defer closeTest(base)
@@ -577,7 +581,7 @@ func TestHTTP1FallbackPreservesConnectionState(t *testing.T) {
 }
 
 func TestWebsiteFallbackWithoutTLSStateRemainsOpaque(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 
 	server, client := net.Pipe()
 	defer closeTest(server)
@@ -602,7 +606,7 @@ func TestWebsiteFallbackWithoutTLSStateRemainsOpaque(t *testing.T) {
 }
 
 func TestPostTLSWrapperAfterAnyTLSFallbackPreservesConnectionState(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 
 	base := newChanListener()
 	defer closeTest(base)
@@ -664,17 +668,18 @@ func TestPostTLSWrapperAfterAnyTLSDoesNotSeeAnyTLSConnections(t *testing.T) {
 	destination := newChanListener()
 	defer closeTest(destination)
 
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 	wrapper.ProbeTimeout = caddy.Duration(time.Second)
-	wrapper.resolveFunc = resolveTestDomain
-	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != testResolvedDestinationAddress {
-			return nil, errors.New("unexpected destination address")
-		}
-		serverConn, clientConn := net.Pipe()
-		destination.enqueue(serverConn)
-		return clientConn, nil
-	}
+	wrapper.defaultSelection = outboundSelection{outbound: &testOutbound{
+		dial: func(ctx context.Context, destinationAddressValue M.Socksaddr) (net.Conn, error) {
+			if destinationAddressValue.String() != destinationAddress {
+				return nil, errors.New("unexpected destination address")
+			}
+			serverConn, clientConn := net.Pipe()
+			destination.enqueue(serverConn)
+			return clientConn, nil
+		},
+	}, name: "test"}
 
 	destDone := make(chan error, 1)
 	go func() {
@@ -776,17 +781,18 @@ func TestAnyTLSEndToEndProxyOverTLSWithH2ALPN(t *testing.T) {
 	destination := newChanListener()
 	defer closeTest(destination)
 
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 	wrapper.ProbeTimeout = caddy.Duration(time.Second)
-	wrapper.resolveFunc = resolveTestDomain
-	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != testResolvedDestinationAddress {
-			return nil, errors.New("unexpected destination address")
-		}
-		serverConn, clientConn := net.Pipe()
-		destination.enqueue(serverConn)
-		return clientConn, nil
-	}
+	wrapper.defaultSelection = outboundSelection{outbound: &testOutbound{
+		dial: func(ctx context.Context, destinationAddressValue M.Socksaddr) (net.Conn, error) {
+			if destinationAddressValue.String() != destinationAddress {
+				return nil, errors.New("unexpected destination address")
+			}
+			serverConn, clientConn := net.Pipe()
+			destination.enqueue(serverConn)
+			return clientConn, nil
+		},
+	}, name: "test"}
 
 	destDone := make(chan error, 1)
 	go func() {
@@ -872,16 +878,17 @@ func TestAnyTLSEndToEndProxy(t *testing.T) {
 	destinationAddress := "service.example.internal:443"
 	destination := newChanListener()
 	defer closeTest(destination)
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
-	wrapper.resolveFunc = resolveTestDomain
-	wrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != testResolvedDestinationAddress {
-			return nil, errors.New("unexpected destination address")
-		}
-		serverConn, clientConn := net.Pipe()
-		destination.enqueue(serverConn)
-		return clientConn, nil
-	}
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
+	wrapper.defaultSelection = outboundSelection{outbound: &testOutbound{
+		dial: func(ctx context.Context, destinationAddressValue M.Socksaddr) (net.Conn, error) {
+			if destinationAddressValue.String() != destinationAddress {
+				return nil, errors.New("unexpected destination address")
+			}
+			serverConn, clientConn := net.Pipe()
+			destination.enqueue(serverConn)
+			return clientConn, nil
+		},
+	}, name: "test"}
 
 	destDone := make(chan error, 1)
 	go func() {
@@ -967,10 +974,12 @@ func TestAnyTLSEndToEndUDPOverTCP(t *testing.T) {
 		udpDone <- err
 	}()
 
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
-	wrapper.listenPacketFunc = func(ctx context.Context, network string, address string) (net.PacketConn, error) {
-		return handlerPacketConn, nil
-	}
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
+	wrapper.defaultSelection = outboundSelection{outbound: &testOutbound{
+		open: func(ctx context.Context) (PacketConn, error) {
+			return &packetConnAdapter{PacketConn: handlerPacketConn}, nil
+		},
+	}, name: "test"}
 	base := newChanListener()
 	defer closeTest(base)
 
@@ -1052,10 +1061,12 @@ func TestAnyTLSEndToEndUDPOverTCPDatagramMode(t *testing.T) {
 		secondDone <- err
 	}()
 
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
-	wrapper.listenPacketFunc = func(ctx context.Context, network string, address string) (net.PacketConn, error) {
-		return handlerPacketConn, nil
-	}
+	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
+	wrapper.defaultSelection = outboundSelection{outbound: &testOutbound{
+		open: func(ctx context.Context) (PacketConn, error) {
+			return &packetConnAdapter{PacketConn: handlerPacketConn}, nil
+		},
+	}, name: "test"}
 	base := newChanListener()
 	defer closeTest(base)
 
@@ -1090,7 +1101,7 @@ func TestAnyTLSEndToEndUDPOverTCPDatagramMode(t *testing.T) {
 	defer closeTest(packetConn)
 
 	dest1 := M.ParseSocksaddr("1.1.1.1:53")
-	dest2 := M.ParseSocksaddr("8.8.8.8:53")
+	dest2 := M.ParseSocksaddr("dns.example.test:53")
 	if _, err := packetConn.WriteTo([]byte("first datagram"), dest1); err != nil {
 		t.Fatalf("WriteTo(dest1) error = %v", err)
 	}
@@ -1098,14 +1109,20 @@ func TestAnyTLSEndToEndUDPOverTCPDatagramMode(t *testing.T) {
 		t.Fatalf("WriteTo(dest2) error = %v", err)
 	}
 
-	buf := make([]byte, 2048)
+	packetBuffer := B.NewPacket()
+	defer packetBuffer.Release()
+	packetReader, ok := packetConn.(N.PacketReader)
+	if !ok {
+		t.Fatalf("packet connection = %T, want network.PacketReader", packetConn)
+	}
 	replies := make(map[string]string, 2)
 	for i := 0; i < 2; i++ {
-		n, addr, err := packetConn.ReadFrom(buf)
+		packetBuffer.Reset()
+		addr, err := packetReader.ReadPacket(packetBuffer)
 		if err != nil {
-			t.Fatalf("ReadFrom() error = %v", err)
+			t.Fatalf("ReadPacket() error = %v", err)
 		}
-		replies[addr.String()] = string(buf[:n])
+		replies[addr.String()] = string(packetBuffer.Bytes())
 	}
 	if replies[dest1.String()] != "FIRST DATAGRAM" {
 		t.Fatalf("reply for %s = %q, want %q", dest1.String(), replies[dest1.String()], "FIRST DATAGRAM")
@@ -1189,19 +1206,19 @@ func TestIdleTimeoutConnTreatsWritesAsActivity(t *testing.T) {
 }
 
 func TestReloadStyleUserDisableStopsNewAnyTLSDetection(t *testing.T) {
-	enabled := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
-	disabled := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: false}}, true)
+	enabled := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
+	disabled := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: false}})
 
 	sum := sha256.Sum256([]byte("secret"))
 	preview := sum[:]
 
-	decision, err := enabled.detector.Detect(preview)
-	if err != nil || decision != DecisionAnyTLS {
+	decision, err := enabled.detector.detect(preview)
+	if err != nil || decision != routeAnyTLS {
 		t.Fatalf("enabled detector = (%v, %v), want AnyTLS", decision, err)
 	}
 
-	decision, err = disabled.detector.Detect(preview)
-	if err == nil || decision != DecisionReject {
+	decision, err = disabled.detector.detect(preview)
+	if err == nil || decision != routeReject {
 		t.Fatalf("disabled detector = (%v, %v), want reject with error", decision, err)
 	}
 }
@@ -1210,12 +1227,12 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 	core, logs := observer.New(zapcore.DebugLevel)
 	logger := zap.New(core)
 
-	fallbackWrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, false)
+	fallbackWrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 	fallbackWrapper.logger = logger
 	fallbackWrapper.service, _ = singanytls.NewService(singanytls.ServiceConfig{
 		PaddingScheme: []byte(fallbackWrapper.PaddingScheme),
 		Users:         fallbackWrapper.anyTLSUsers(),
-		Handler:       &directTCPHandler{config: fallbackWrapper},
+		Handler:       &proxyHandler{config: fallbackWrapper},
 		Logger:        zapLogger{base: logger},
 	})
 
@@ -1248,21 +1265,22 @@ func TestStructuredLogsForFallbackAndProxy(t *testing.T) {
 	destinationAddress := "service.example.internal:443"
 	destination := newChanListener()
 	defer closeTest(destination)
-	proxyWrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}}, true)
+	proxyWrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 	proxyWrapper.logger = logger2
-	proxyWrapper.resolveFunc = resolveTestDomain
-	proxyWrapper.dialFunc = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		if address != testResolvedDestinationAddress {
-			return nil, errors.New("unexpected destination address")
-		}
-		serverConn, clientConn := net.Pipe()
-		destination.enqueue(serverConn)
-		return clientConn, nil
-	}
+	proxyWrapper.defaultSelection = outboundSelection{outbound: &testOutbound{
+		dial: func(ctx context.Context, destinationAddressValue M.Socksaddr) (net.Conn, error) {
+			if destinationAddressValue.String() != destinationAddress {
+				return nil, errors.New("unexpected destination address")
+			}
+			serverConn, clientConn := net.Pipe()
+			destination.enqueue(serverConn)
+			return clientConn, nil
+		},
+	}, name: "test"}
 	service, err := singanytls.NewService(singanytls.ServiceConfig{
 		PaddingScheme: []byte(proxyWrapper.PaddingScheme),
 		Users:         proxyWrapper.anyTLSUsers(),
-		Handler:       &directTCPHandler{config: proxyWrapper},
+		Handler:       &proxyHandler{config: proxyWrapper},
 		Logger:        zapLogger{base: logger2},
 	})
 	if err != nil {
@@ -1373,16 +1391,18 @@ func TestReloadStyleClosesExistingSessions(t *testing.T) {
 	destinationAddress := destination.Addr().String()
 
 	users := []User{
-		{Name: "alice", Password: "alice-pass", Enabled: true, Outbound: "wg-a"},
-		{Name: "bob", Password: "bob-pass", Enabled: true, Outbound: "wg-b"},
+		{Name: "alice", Password: "alice-pass", Enabled: true, Outbound: "exit-a"},
+		{Name: "bob", Password: "bob-pass", Enabled: true, Outbound: "exit-b"},
 	}
-	wrapper := newTestWrapper(t, users, true)
+	wrapper := newTestWrapper(t, users)
 	wrapper.logger = logger
 	recA := &recordingOutbound{inner: new(DirectOutbound)}
 	recB := &recordingOutbound{inner: new(DirectOutbound)}
-	wrapper.namedOutbounds = map[string]Outbound{"wg-a": recA, "wg-b": recB, "direct": new(DirectOutbound)}
-	wrapper.userOutbound = map[string]Outbound{"alice": recA, "bob": recB}
-	wrapper.userOutboundName = map[string]string{"alice": "wg-a", "bob": "wg-b"}
+	wrapper.namedOutbounds = map[string]Outbound{"exit-a": recA, "exit-b": recB, "direct": new(DirectOutbound)}
+	wrapper.userSelections = map[string]outboundSelection{
+		"alice": {outbound: recA, name: "exit-a"},
+		"bob":   {outbound: recB, name: "exit-b"},
+	}
 
 	base := newChanListener()
 	defer closeTest(base)
@@ -1403,14 +1423,14 @@ func TestReloadStyleClosesExistingSessions(t *testing.T) {
 		}
 	}
 
-	if !waitForCondition(time.Second, func() bool { return wrapper.activeSessionCount() == 2 }) {
-		t.Fatalf("active sessions = %d, want 2", wrapper.activeSessionCount())
+	if !waitForCondition(time.Second, func() bool { return testActiveSessionCount(wrapper) == 2 }) {
+		t.Fatalf("active sessions = %d, want 2", testActiveSessionCount(wrapper))
 	}
 	// The server-side dial completes asynchronously after the stream request.
 	if !waitForCondition(time.Second, func() bool {
 		return len(recA.dials()) == 1 && len(recB.dials()) == 1
 	}) {
-		t.Fatalf("dials = (wg-a %v, wg-b %v), want one in-flight connection through each named outbound", recA.dials(), recB.dials())
+		t.Fatalf("dials = (exit-a %v, exit-b %v), want one in-flight connection through each named outbound", recA.dials(), recB.dials())
 	}
 
 	if err := wrapper.Cleanup(); err != nil {
@@ -1465,18 +1485,18 @@ func TestPerUserOutboundSelectionEndToEnd(t *testing.T) {
 	targetAddress := target.Addr().String()
 
 	users := []User{
-		{Name: "home", Password: "home-pass", Enabled: true, Outbound: "wg-home"},
+		{Name: "home", Password: "home-pass", Enabled: true, Outbound: "exit-home"},
 		{Name: "away", Password: "away-pass", Enabled: true},
 	}
-	wrapper := newTestWrapper(t, users, true)
+	wrapper := newTestWrapper(t, users)
 	wrapper.logger = logger
 	recHome := &recordingOutbound{inner: new(DirectOutbound)}
 	recAway := &recordingOutbound{inner: new(DirectOutbound)}
-	wrapper.namedOutbounds = map[string]Outbound{"wg-home": recHome, "wg-away": recAway, "direct": new(DirectOutbound)}
-	wrapper.userOutbound = map[string]Outbound{"home": recHome}
-	wrapper.userOutboundName = map[string]string{"home": "wg-home"}
-	wrapper.defaultOutbound = recAway
-	wrapper.defaultOutboundName = "wg-away"
+	wrapper.namedOutbounds = map[string]Outbound{"exit-home": recHome, "exit-away": recAway, "direct": new(DirectOutbound)}
+	wrapper.userSelections = map[string]outboundSelection{
+		"home": {outbound: recHome, name: "exit-home"},
+	}
+	wrapper.defaultSelection = outboundSelection{outbound: recAway, name: "exit-away"}
 
 	base := newChanListener()
 	defer closeTest(base)
@@ -1488,8 +1508,8 @@ func TestPerUserOutboundSelectionEndToEnd(t *testing.T) {
 		recorder *recordingOutbound
 		outbound string
 	}{
-		{user: "home", password: "home-pass", recorder: recHome, outbound: "wg-home"},
-		{user: "away", password: "away-pass", recorder: recAway, outbound: "wg-away"},
+		{user: "home", password: "home-pass", recorder: recHome, outbound: "exit-home"},
+		{user: "away", password: "away-pass", recorder: recAway, outbound: "exit-away"},
 	} {
 		client := newTestAnyTLSClient(t, base, tt.password)
 		proxyConn, err := client.CreateProxy(t.Context(), M.ParseSocksaddr(targetAddress))
@@ -1505,7 +1525,7 @@ func TestPerUserOutboundSelectionEndToEnd(t *testing.T) {
 		closeTest(proxyConn)
 
 		dials := tt.recorder.dials()
-		if len(dials) != 1 || dials[0] != targetAddress {
+		if len(dials) != 1 || dials[0].String() != targetAddress {
 			t.Fatalf("user %s recorded dials = %v, want exactly [%s]", tt.user, dials, targetAddress)
 		}
 

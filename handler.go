@@ -2,7 +2,6 @@ package anytls
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -13,13 +12,8 @@ import (
 	"go.uber.org/zap"
 )
 
-type directTCPHandler struct {
+type proxyHandler struct {
 	config *ListenerWrapper
-}
-
-type dialResult struct {
-	conn net.Conn
-	err  error
 }
 
 type handshakeFailureReporter interface {
@@ -30,12 +24,11 @@ type handshakeSuccessReporter interface {
 	HandshakeSuccess() error
 }
 
-func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+func (h *proxyHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	startedAt := time.Now()
 	connectionID := connectionIDFromContext(ctx)
-	// The outbound name is resolved once per connection and reused, so the
-	// concurrent happy-eyeballs dial goroutines never log it repeatedly.
-	_, outboundName := h.outboundForUser(ctx)
+	// Resolve the outbound name once so all logs for this connection agree.
+	outboundName := h.outboundNameForUser(ctx)
 	h.config.updateSessionUser(connectionID, userFromContext(ctx))
 	if !h.config.acquireStream(connectionID) {
 		err := fmt.Errorf("%w", errStreamLimitExceeded)
@@ -117,8 +110,8 @@ func (h *directTCPHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 	relay(ctx, inbound, outboundRelay, closeOnce)
 }
 
-func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, connectionID uint64, outboundName string, closeOnce N.CloseHandlerFunc) {
-	request, err := h.readUDPOverTCPRequest(ctx, conn, destination)
+func (h *proxyHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, connectionID uint64, outboundName string, closeOnce N.CloseHandlerFunc) {
+	request, err := h.readUDPOverTCPRequest(conn, destination)
 	if err != nil {
 		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), outboundName, err)
 		reportHandshakeFailure(conn, err)
@@ -127,7 +120,7 @@ func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, 
 		return
 	}
 
-	packetConn, err := h.listenPacketContext(ctx)
+	packetConn, err := h.openPacketContext(ctx)
 	if err != nil {
 		h.logOutboundFailure(connectionID, source, request.Destination, startedAt, userFromContext(ctx), outboundName, err)
 		reportHandshakeFailure(conn, err)
@@ -156,124 +149,24 @@ func (h *directTCPHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, 
 		zap.String("destination", request.Destination.String()),
 	)
 
-	relayUDPOverTCP(ctx, uotConn, packetConn, h.preparePacketDestination, closeOnce)
+	relayUDPOverTCP(ctx, uotConn, packetConn, closeOnce)
 }
 
-func (h *directTCPHandler) dialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+func (h *proxyHandler) dialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	if err := validateDestination(destination); err != nil {
+		return nil, err
+	}
 	if timeout := time.Duration(h.config.ConnectTimeout); timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 
-	resolvedDestinations, err := h.validateStreamDestination(ctx, destination)
+	outbound, err := h.streamOutboundForUser(ctx)
 	if err != nil {
 		return nil, err
 	}
-	resolvedDestinations = interleaveAddressFamilies(resolvedDestinations)
-
-	results := make(chan dialResult)
-	dialCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	launchDial := func(resolvedDestination M.Socksaddr) {
-		go func() {
-			conn, dialErr := h.dialResolved(dialCtx, resolvedDestination.String())
-			if dialErr != nil {
-				dialErr = fmt.Errorf("dial %s: %w", resolvedDestination.String(), dialErr)
-			}
-			results <- dialResult{conn: conn, err: dialErr}
-		}()
-	}
-
-	const fallbackDelay = 250 * time.Millisecond
-	next := 1
-	inFlight := 1
-	launchDial(resolvedDestinations[0])
-	fallbackTimer := time.NewTimer(fallbackDelay)
-	defer fallbackTimer.Stop()
-	fallbackTimerC := fallbackTimer.C
-	if len(resolvedDestinations) == 1 {
-		fallbackTimerC = nil
-	}
-
-	var errs []error
-	for inFlight > 0 {
-		select {
-		case result := <-results:
-			inFlight--
-			if result.err == nil && result.conn != nil {
-				cancel()
-				go drainDialResults(results, inFlight)
-				return result.conn, nil
-			}
-			if result.err == nil {
-				result.err = errors.New("dial returned a nil connection")
-			}
-			errs = append(errs, result.err)
-			if next < len(resolvedDestinations) {
-				launchDial(resolvedDestinations[next])
-				next++
-				inFlight++
-				fallbackTimer.Reset(fallbackDelay)
-				if next < len(resolvedDestinations) {
-					fallbackTimerC = fallbackTimer.C
-				} else {
-					fallbackTimerC = nil
-				}
-			}
-		case <-fallbackTimerC:
-			launchDial(resolvedDestinations[next])
-			next++
-			inFlight++
-			if next < len(resolvedDestinations) {
-				fallbackTimer.Reset(fallbackDelay)
-			} else {
-				fallbackTimerC = nil
-			}
-		case <-ctx.Done():
-			cancel()
-			go drainDialResults(results, inFlight)
-			return nil, errors.Join(append(errs, ctx.Err())...)
-		}
-	}
-	return nil, errors.Join(errs...)
-}
-
-func drainDialResults(results <-chan dialResult, remaining int) {
-	for range remaining {
-		result := <-results
-		if result.conn != nil {
-			_ = result.conn.Close()
-		}
-	}
-}
-
-func interleaveAddressFamilies(destinations []M.Socksaddr) []M.Socksaddr {
-	if len(destinations) < 2 {
-		return destinations
-	}
-	firstIsIPv6 := destinations[0].Addr.Is6()
-	preferred := make([]M.Socksaddr, 0, len(destinations))
-	alternate := make([]M.Socksaddr, 0, len(destinations))
-	for _, destination := range destinations {
-		if destination.Addr.Is6() == firstIsIPv6 {
-			preferred = append(preferred, destination)
-		} else {
-			alternate = append(alternate, destination)
-		}
-	}
-	interleaved := make([]M.Socksaddr, 0, len(destinations))
-	for len(preferred) > 0 || len(alternate) > 0 {
-		if len(preferred) > 0 {
-			interleaved = append(interleaved, preferred[0])
-			preferred = preferred[1:]
-		}
-		if len(alternate) > 0 {
-			interleaved = append(interleaved, alternate[0])
-			alternate = alternate[1:]
-		}
-	}
-	return interleaved
+	return outbound.DialContext(ctx, destination)
 }
 
 func reportHandshakeFailure(conn net.Conn, err error) {
@@ -291,7 +184,7 @@ func reportHandshakeSuccess(conn net.Conn) error {
 	return nil
 }
 
-func (h *directTCPHandler) logHandshakeSuccessFailure(connectionID uint64, protocol string, user string, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, err error) {
+func (h *proxyHandler) logHandshakeSuccessFailure(connectionID uint64, protocol string, user string, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, err error) {
 	h.config.logger.Warn("anytls handshake success report failed",
 		zap.Uint64("connection_id", connectionID),
 		zap.String("event", "anytls_handshake"),
@@ -306,25 +199,17 @@ func (h *directTCPHandler) logHandshakeSuccessFailure(connectionID uint64, proto
 	)
 }
 
-func (h *directTCPHandler) dialResolved(ctx context.Context, address string) (net.Conn, error) {
-	if h.config.dialFunc != nil {
-		return h.config.dialFunc(ctx, "tcp", address)
-	}
+func (h *proxyHandler) openPacketContext(ctx context.Context) (PacketConn, error) {
 	if timeout := time.Duration(h.config.ConnectTimeout); timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	outbound, _ := h.outboundForUser(ctx)
-	return outbound.DialContext(ctx, "tcp", address)
-}
-
-func (h *directTCPHandler) listenPacketContext(ctx context.Context) (net.PacketConn, error) {
-	if h.config.listenPacketFunc != nil {
-		return h.config.listenPacketFunc(ctx, "udp", "")
+	outbound, err := h.streamOutboundForUser(ctx)
+	if err != nil {
+		return nil, err
 	}
-	outbound, _ := h.outboundForUser(ctx)
-	return outbound.ListenPacket(ctx, "udp", "")
+	return outbound.OpenPacket(ctx)
 }
 
 // outboundForUser resolves the egress module and its log name for the
@@ -332,18 +217,32 @@ func (h *directTCPHandler) listenPacketContext(ctx context.Context) (net.PacketC
 // outbound reference, then the resolved default outbound, then the single
 // configured outbound, then a direct outbound (the last two tiers cover
 // wrappers built by hand without Provision, for example in unit tests). All
-// maps involved are read-only after Provision, so the concurrent
-// happy-eyeballs dial goroutines can call this without locking; repeated
-// calls for one connection are idempotent.
-func (h *directTCPHandler) outboundForUser(ctx context.Context) (Outbound, string) {
-	user := userFromContext(ctx)
-	if outbound, ok := h.config.userOutbound[user]; ok {
-		return outbound, h.config.userOutboundName[user]
-	}
-	return h.config.resolveDefaultOutbound()
+// routing tables are read-only after Provision, so concurrent handlers can
+// call this without locking; repeated calls for one connection are idempotent.
+func (h *proxyHandler) outboundForUser(ctx context.Context) outboundSelection {
+	return h.config.outboundSelectionForUser(userFromContext(ctx))
 }
 
-func (h *directTCPHandler) readUDPOverTCPRequest(ctx context.Context, conn net.Conn, destination M.Socksaddr) (*uot.Request, error) {
+func (h *proxyHandler) outboundNameForUser(ctx context.Context) string {
+	if selected, ok := streamOutboundFromContext(ctx); ok {
+		return selected.name
+	}
+	return h.outboundForUser(ctx).name
+}
+
+func (h *proxyHandler) streamOutboundForUser(ctx context.Context) (StreamOutbound, error) {
+	if selected, ok := streamOutboundFromContext(ctx); ok {
+		return selected.outbound, nil
+	}
+	selection := h.outboundForUser(ctx)
+	outbound, ok := selection.outbound.(StreamOutbound)
+	if !ok {
+		return nil, fmt.Errorf("outbound %q does not handle local AnyTLS streams", selection.name)
+	}
+	return outbound, nil
+}
+
+func (h *proxyHandler) readUDPOverTCPRequest(conn net.Conn, destination M.Socksaddr) (*uot.Request, error) {
 	switch destination.Fqdn {
 	case uot.MagicAddress:
 		request, err := uot.ReadRequest(conn)
@@ -351,8 +250,8 @@ func (h *directTCPHandler) readUDPOverTCPRequest(ctx context.Context, conn net.C
 			return nil, fmt.Errorf("%w: %w", errInvalidUDPOverTCPRequest, err)
 		}
 		if request.IsConnect {
-			if _, err := h.validatePacketDestination(ctx, request.Destination); err != nil {
-				return nil, err
+			if !request.Destination.IsValid() || request.Destination.Port == 0 {
+				return nil, fmt.Errorf("%w: %s", errInvalidDestination, request.Destination.String())
 			}
 		}
 		return request, nil
@@ -363,38 +262,7 @@ func (h *directTCPHandler) readUDPOverTCPRequest(ctx context.Context, conn net.C
 	}
 }
 
-func (h *directTCPHandler) preparePacketDestination(ctx context.Context, destination M.Socksaddr) (net.Addr, error) {
-	resolvedDestinations, err := h.validatePacketDestination(ctx, destination)
-	if err != nil {
-		return nil, err
-	}
-	return resolveUDPAddr(resolvedDestinations[0])
-}
-
-func (h *directTCPHandler) resolveDestination(ctx context.Context, destination M.Socksaddr) ([]M.Socksaddr, error) {
-	if destination.Addr.IsValid() {
-		return []M.Socksaddr{destination}, nil
-	}
-	resolveFunc := h.config.resolveFunc
-	if resolveFunc == nil {
-		outbound, _ := h.outboundForUser(ctx)
-		resolveFunc = outbound.LookupNetIP
-	}
-	addresses, err := resolveFunc(ctx, "ip", destination.Fqdn)
-	if err != nil {
-		return nil, fmt.Errorf("resolve destination %s: %w", destination.String(), err)
-	}
-	if len(addresses) == 0 {
-		return nil, fmt.Errorf("resolve destination %s: no addresses", destination.String())
-	}
-	destinations := make([]M.Socksaddr, 0, len(addresses))
-	for _, addr := range addresses {
-		destinations = append(destinations, M.Socksaddr{Addr: addr, Port: destination.Port})
-	}
-	return destinations, nil
-}
-
-func (h *directTCPHandler) logOutboundFailure(connectionID uint64, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, user string, outboundName string, err error) {
+func (h *proxyHandler) logOutboundFailure(connectionID uint64, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, user string, outboundName string, err error) {
 	protocol := "tcp"
 	if isUDPOverTCPDestination(destination) {
 		protocol = "udp_over_tcp_v2"

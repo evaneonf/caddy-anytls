@@ -31,7 +31,8 @@
 2. Caddy 完成 TLS 握手与证书选择。
 3. 模块对解密后的连接进行首包识别。
 4. 若判定为 AnyTLS，则模块接管该连接。
-5. 连接进入认证、出站策略校验、目标地址解析、出站建立与双向转发流程。
+5. 模块从密码哈希识别用户并选择出站。
+6. `direct` / `socks5` 在本机解析会话并建立目标连接；`anytls` 替换上游认证哈希后中继完整会话。
 
 ## 关键设计点
 
@@ -61,7 +62,7 @@ AnyTLS 协议处理复用 `github.com/anytls/sing-anytls`，模块本身只保�
 
 - 网站回落控制
 - 首包识别入口
-- 用户配置与策略边界
+- 用户配置与出站选择
 - 目标连接桥接
 - Caddy 生命周期对接
 
@@ -69,22 +70,16 @@ AnyTLS 协议处理复用 `github.com/anytls/sing-anytls`，模块本身只保�
 
 普通网站流量支持快速回落路径：模块会优先识别 HTTP/2 preface 和常见 HTTP/1 方法前缀，命中后无需等待完整 32 字节 AnyTLS 哈希探测即可返回网站链路。这避免了合法网站首包较短时被 `probe_timeout` 放大延迟。
 
-### 出站目标策略
+### 出站选择
 
-AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
+模块在非消费式窥探密码哈希时即可识别并验证本地用户，随后根据用户名选择具名出站；未显式指定的用户依次使用默认出站或内置 `direct`。
 
-1. 检查目标地址和端口是否合法。
-2. 执行端口和域名策略。
-3. 必要时解析域名，得到一个或多个 IP 地址。
-4. 对解析后的所有地址执行私网和 CIDR 策略。
-5. TCP 目标按解析结果顺序尝试拨号，直到成功或全部失败。
+- `direct` / `socks5` 调用本地会话处理器，由 `sing-anytls` 解析各子流，再把未解析目标交给对应流级连接器。
+- `anytls` 在进入本地 `sing-anytls` service 前建立上游 TLS，将最前面的 32 字节认证哈希替换成上游密码哈希，然后原样中继 padding 和所有会话帧。上游因而保留完整的目标握手成功/失败、TCP、UDP-over-TCP 和 DNS 处理语义。
 
-策略优先级如下：
+这种选择粒度是用户/物理会话，不是单个目标子流。同一条中继会话中的所有流量都会进入同一个 AnyTLS 上游。
 
-- `deny_*` 优先于 `allow_*`
-- 配置了 `allow_*` 后，未命中的目标会被拒绝
-- `allow_private_targets = false` 时，私网、回环、链路本地、未指定和组播目标默认拒绝
-- `allow_cidr` 可以精确放行指定 CIDR，即使该 CIDR 属于默认私网保护范围
+入口的 `max_concurrent` 与 `idle_timeout` 仍作用于中继物理会话；由于入口不解析其中的 stream，`max_streams_per_session` 和 `max_concurrent_streams` 只约束本机处理路径，中继路径的子流限制由最终上游实施。
 
 ### 生命周期与配置重载
 
@@ -98,9 +93,9 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
 - 网站链路不参与 AnyTLS 会话清理
 - 旧 AnyTLS 会话在配置卸载时经 `Cleanup()` 主动终止
 
-这一行为是有意为之。对于用户禁用、删除或策略收紧等场景，旧会话继续存活会导致安全边界模糊，因此当前实现选择在配置代际切换时清理存量 AnyTLS 会话。
+这一行为是有意为之。用户禁用、删除或出站映射变化后，旧会话继续存活会导致配置代际边界模糊，因此当前实现选择在配置代际切换时清理存量 AnyTLS 会话。
 
-### 安全默认值
+### 运行默认值
 
 当前默认值围绕保守接入策略设定：
 
@@ -112,7 +107,6 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
 - `max_pending_probes = 256`
 - `max_streams_per_session = 256`
 - `max_concurrent_streams = 1024`
-- `allow_private_targets = false`
 - `padding_scheme` 使用 `sing-anytls` 默认值
 
 除上述默认值外，当前实现还遵循以下安全行为：
@@ -120,10 +114,7 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
 - 默认审计日志不输出密码
 - `log_node_info` 需要显式开启，开启后会输出包含密码的 AnyTLS URI，适合日志访问权限可控的部署环境
 - 用户被禁用后，新命中的连接不会回落到网站
-- 默认拒绝访问常见私网目标地址
-- 域名目标会在解析后检查所有返回地址，解析到私网地址时默认拒绝
-- `deny_*` 出站策略优先于 `allow_*` 策略
-- `allow_cidr` 可精确放行指定 CIDR，包括默认私网保护下的受控内网段
+- 认证成功的用户可以连接客户端指定的目标，不附加目标过滤规则
 
 ## 配置模型
 
@@ -139,22 +130,20 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
   "max_streams_per_session": 256,
   "max_concurrent_streams": 1024,
   "fallback": true,
-  "allow_private_targets": false,
-  "allow_cidrs": [],
-  "deny_cidrs": [],
-  "allow_ports": [],
-  "deny_ports": [],
-  "allow_domains": [],
-  "deny_domains": [],
   "log_node_info": false,
   "node_hosts": ["example.com"],
   "node_port": 443,
   "node_sni": "example.com",
   "node_insecure": false,
   "outbounds": {
-    "wg-home": {"dialer": "wireguard", "tunnel": "home"}
+    "proxy": {
+      "dialer": "socks5",
+      "address": "127.0.0.1:1080",
+      "username": "proxy-user",
+      "password": "proxy-password"
+    }
   },
-  "default_outbound": "wg-home",
+  "default_outbound": "proxy",
   "users": [
     {
       "name": "device-1",
@@ -199,50 +188,55 @@ AnyTLS 命中后，模块会在建立出站连接前执行策略校验：
 - AnyTLS 会话认证成功
 - 网站 fallback
 - 禁用用户拒绝
-- 私网目标拒绝
-- 出站策略拒绝
 - TCP relay 关闭及字节计数
 - 配置卸载导致的会话终止
 
 ## 出站扩展点
 
-出站（egress）通过 Caddy guest module 机制可插拔，命名空间为 `caddy.listeners.anytls.outbounds`，inline key 为 `dialer`。模块需实现 `Outbound` 接口（`LookupNetIP` + `DialContext` + `ListenPacket`，见 `outbound.go`）。未配置或配置为 `null` 时回退到内置 `direct` 出站（本地网络栈直连）。
+出站（egress）通过 Caddy guest module 机制可插拔，命名空间为 `caddy.listeners.anytls.outbounds`，inline key 为 `dialer`。所有模块统一实现会话级 `Outbound.HandleSession`。未配置或配置为 `null` 时回退到内置 `direct` 出站。
+
+本机处理型模块还实现流级 `StreamOutbound`（`DialContext` + `OpenPacket`），并在 `HandleSession` 中调用 `OutboundSession.ServeLocal`。内置 `direct` 和 `socks5` 属于这一类。内置 `anytls` 则直接使用 `OutboundSession.Connection` 中继协议会话，不实现流级接口。
 
 ### 按用户选择出站
 
-一个 wrapper 可以在 `outbounds`（JSON 为 `map[string]模块对象`，Caddyfile 为 `outbound <name> <module>`）中声明任意多个具名出站，`users[].outbound` 按名引用其中之一。选择发生在拨号时：handler 从连接上下文读取认证用户名，查只读映射得到该用户的出站，TCP（`dialResolved`）与 UDP over TCP（`listenPacketContext`）同源选择。
+一个 wrapper 可以在 `outbounds`（JSON 为 `map[string]模块对象`，Caddyfile 为 `outbound <name> <module>`）中声明任意多个具名出站，`users[].outbound` 按名引用其中之一。选择发生在物理会话进入本地 `sing-anytls` service 之前：listener 从已经窥探的密码哈希取得用户名，查只读映射得到该用户的出站。
 
-默认出站解析顺序（向后兼容硬规则）：
+对于本机处理型出站，选择结果通过连接上下文传给各子流 handler，TCP（`dialContext`）与 UDP over TCP（`openPacketContext`）使用同一个 `StreamOutbound`。对于 `anytls`，本地 service 不会启动，整条会话直接进入上游。
 
-1. `default_outbound` 非空 → 该具名出站；
-2. 否则单 `outbound` 模块非空 → 它（日志中出站名为哨兵 `default`）；
-3. 否则 → 内置 `direct`。
+默认出站规则只有两层：配置 `default_outbound` 时使用它引用的具名出站，否则使用内置 `direct`。用户显式指定的出站优先于默认值。
 
-保留名 `direct` 与 `default` 不可在 `outbounds` 中声明：`direct` 始终指向内置直连出站、无需声明即可被引用；`default` 是旧式无名默认档的日志哨兵。引用未声明的出站名在 `Provision` 阶段报错。
+保留名 `direct` 不可在 `outbounds` 中声明，它始终指向内置直连出站、无需声明即可被引用。引用未声明的出站名在 `Provision` 阶段报错。无名 `outbound` 不属于配置模型：Caddyfile 必须写成 `outbound <name> <module>`，JSON 必须在 `outbounds` 对象中声明模块。
 
 运行期映射（名→出站、用户→出站）在 `Provision` 内一次性构建、之后只读，拨号路径并发读取无需加锁。
 
 ### 职责边界
 
-域名解析由认证用户实际选中的出站执行。`direct` 使用宿主机解析器；隧道出站必须通过隧道内可达的 DNS 服务器解析，不能静默回落到宿主机 DNS。解析结果返回 wrapper 后，再执行私网/端口/域名/CIDR 策略校验；只有全部地址通过检查，才会将已解析的 `ip:port` 交给同一个出站拨号。这样既保证 DNS 与目标连接使用同一出口，也不会牺牲 SSRF 防护。
+本机处理的 TCP 和 UDP-over-TCP 都将客户端请求的未解析 `M.Socksaddr` 交给选中的 `StreamOutbound`。通用 relay 不解析域名，也不维护 DNS 缓存。
 
-WireGuard 等物理隧道资源应由对应插件在全局 App 中集中定义；AnyTLS 出站只保存对隧道名的引用。这样同一 device 可以被多个 AnyTLS 逻辑出口或 `reverse_proxy` transport 共享，不会因为重复内联同一密钥而创建互相抢占 endpoint 的设备。
+- `direct` 的 TCP 使用 `net.Dialer`，UDP 发送前使用宿主机 resolver 解析域名。
+- `socks5` 将 TCP 域名写入 CONNECT 请求，将每个 UDP 域名写入 SOCKS5 UDP 数据报头，由代理端解析。
+- `anytls` 不读取目标地址；入口仅解析上游 `address`，目标域名随会话帧到最终上游后再处理。
+
+UDP 使用项目定义的 `PacketConn` 小接口，其 `ReadPacket` / `WritePacket` 显式携带 `M.Socksaddr`。不使用 `net.PacketConn` 作为出站边界，避免在通用层提前把域名转换成 `net.UDPAddr`。
+
+第三方出站所需的连接池、隧道或代理客户端等资源由对应模块自行管理。wrapper 只保存模块配置并通过统一的 `Outbound` 接口分派会话，不感知具体出口资源的实现方式。
 
 ### 实现契约
 
-- 三个方法会被多个 handler goroutine 并发调用（每条 AnyTLS 连接一个），实现必须并发安全。
-- `LookupNetIP` 必须通过该出站的网络路径解析，并遵循 `ctx` 的截止时间和取消信号；不得为了兼容性回落到宿主机 DNS。
-- 返回的 `net.Conn` / `net.PacketConn` 由 relay 负责关闭；每次调用必须返回独立连接，不得返回共享或缓存的连接。
-- `ctx` 携带 `connect_timeout` 的截止时间与取消信号，建连期间必须遵守。
-- `ListenPacket` 返回的连接按非 connected 方式使用：relay 会用 `WriteTo` 发往任意已解析的 UDP 目标。
-- TCP 目标解析出多个候选地址时，wrapper 会在同一条连接内对**同一个出站**并发调用 `DialContext` 最多 N 次（happy-eyeballs），胜者保留、落败连接由调用方关闭。隧道型出站要为这种瞬时拨号扇出预留连接数/速率预算。
+- `HandleSession` 会被多个物理会话并发调用，实现必须并发安全，并在会话结束前保持阻塞。
+- 本机处理型模块调用 `ServeLocal` 后，由本地 service 管理会话；其 `DialContext` / `OpenPacket` 仍可能被多个 handler goroutine 并发调用。
+- 流级接口返回的 `net.Conn` / `PacketConn` 由 relay 负责关闭；每次调用必须返回独立连接，不得返回共享或缓存的连接。
+- `HandleSession` 的 `ctx` 携带会话取消信号；`OutboundSession.ConnectTimeout()` 给出建连超时。流级 handler 会为 `DialContext` / `OpenPacket` 建立相同的超时上下文。
+- `OpenPacket` 返回的连接需要支持向任意未解析目标发送数据报；实现自行决定本地解析、远端解析或其它路由方式。
+- `PacketConn` 的方法返回后不得继续持有调用方提供的字节切片。
+- 会话级中继若消费认证头，必须保留后续协议字节顺序；内置 `anytls` 只替换固定 32 字节密码哈希。
 - 出站必须容忍 `Cleanup` 时仍有在用连接：Caddy 对各模块 `Cleanup` 的遍历没有跨模块顺序保证，出站的 `Cleanup` 可能先于 wrapper 关闭活跃会话执行。届时在用连接报错即可，由 relay 负责关闭，不会泄漏。
 
 ### 生命周期
 
 出站模块的生命周期完全交给 Caddy 模块系统：经 `ctx.LoadModule` 加载并 Provision（具名出站同理，逐个加载）；配置卸载时 Caddy 调用各模块的 `Cleanup`。wrapper 在自己的 `Cleanup()` 中主动关闭全部活跃会话，但 Caddy 不保证 wrapper 与出站模块的 `Cleanup` 先后顺序，因此出站模块须按上文契约容忍清理时仍存在使用中的连接。
 
-参考实现：内置 `direct`（`outbound.go`）；外部 WireGuard 出站 `github.com/lihuaye/caddy-wireguard`。
+仓库内置 `direct`（`outbound.go`）、`socks5`（`outbound_socks5.go`）和 `anytls`（`outbound_anytls.go`）；其它实现可由独立的第三方模块提供和维护。
 
 ## 已知约束
 

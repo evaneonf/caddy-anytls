@@ -10,12 +10,10 @@ Caddy 继续负责 `443` 监听、TLS、证书和网站路由；本模块只在 
 - 复用 Caddy 自动 HTTPS 和证书生命周期
 - 非 AnyTLS 流量回落真实网站
 - 支持多用户、TCP 和 `UDP over TCP v2`
-- 支持多个具名出站并按用户选择出口（如部分账号走 WireGuard 家宽、部分直连）
-- 默认拒绝私网目标，支持 CIDR、端口和域名策略
+- 内置 `direct`、`socks5`、`anytls` 三种出站，支持具名声明、默认出口和按用户选择
 - TLS 握手与首包探测采用有界并发，不阻塞 Caddy 的接收循环
 - 空闲超时按双向活动刷新，支持单向长时间传输
 - 提供会话、探测和代理子流三级资源限制
-- 多地址出站共享统一超时预算，并交错尝试 IPv4/IPv6
 - 输出结构化审计日志，可选输出节点 URI
 
 ## 工作方式
@@ -25,7 +23,9 @@ client
   -> Caddy :443
     -> TLS handshake
       -> caddy-anytls 探测解密后的首包
-        -> AnyTLS：认证、策略校验、连接目标并转发
+        -> AnyTLS：识别用户并选择 outbound
+          -> direct / socks5：本机解析会话并转发目标
+          -> anytls：替换上游认证信息并中继完整会话
         -> HTTP：交还 Caddy 网站处理链路
 ```
 
@@ -92,14 +92,6 @@ docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfi
 docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 ```
 
-默认的 `latest` 与版本标签只包含 `caddy-anytls`。需要使用 WireGuard 出站时，请改用额外包含 `caddy-wireguard` 的预构建变体：
-
-```sh
-docker pull ghcr.io/evaneonf/caddy-anytls:wireguard
-```
-
-正式版本也提供对应标签，例如 `vX.Y.Z-wireguard`。WireGuard 变体不会替换精简的默认镜像。
-
 ## 本地构建
 
 使用 `xcaddy` 构建包含当前模块的 Caddy：
@@ -116,7 +108,7 @@ docker compose up -d --build
 
 ## 生产配置示例
 
-下面的示例显式展示了资源边界和出站限制。未写出的值与默认值一致，可以按机器规模和用户数量调整。
+下面的示例显式展示了资源边界。未写出的值与默认值一致，可以按机器规模和用户数量调整。
 
 ```caddyfile
 {
@@ -133,10 +125,6 @@ docker compose up -d --build
 				max_concurrent_streams 1024
 
 				fallback true
-				allow_private_targets false
-				deny_port 25
-				deny_cidr 127.0.0.0/8 169.254.0.0/16
-				deny_domain .blocked.example
 
 				log_node_info false
 				user phone-1 replace-with-a-long-random-password
@@ -160,7 +148,7 @@ example.com {
 | --- | --- | --- |
 | `probe_timeout` | `5s` | TLS 握手和 TLS 后首包探测超时 |
 | `idle_timeout` | `2m` | AnyTLS 会话空闲超时，任一方向有效读写都会刷新 |
-| `connect_timeout` | `10s` | DNS 解析与全部候选地址拨号共享的总超时 |
+| `connect_timeout` | `10s` | 单次目标连接或 AnyTLS 上游会话建连的超时 |
 | `max_pending_probes` | `256` | 最大并发 TLS 握手与首包探测数 |
 | `max_concurrent` | `128` | 最大并发 AnyTLS 物理会话数 |
 | `max_streams_per_session` | `256` | 单条 AnyTLS 会话的最大并发代理子流数 |
@@ -168,27 +156,16 @@ example.com {
 | `fallback` | `true` | 非 AnyTLS 流量是否交还网站 |
 | `padding_scheme` | 上游默认值 | `sing-anytls` padding 策略 |
 
-`max_concurrent` 限制底层 AnyTLS 会话；一条会话可以复用多个目标连接，因此还应保留子流限制。握手和探测并发达到上限后，新连接先在系统监听队列中等待，不会创建无限 goroutine。
+`max_concurrent` 限制底层 AnyTLS 会话；一条会话可以复用多个目标连接，因此本机处理时还应保留子流限制。选择 `anytls` 出站后，入口不解析子流，本机的两个 stream 限制不再适用，子流资源边界由最终上游负责。握手和探测并发达到上限后，新连接先在系统监听队列中等待，不会创建无限 goroutine。
 
-### 出站策略
+### 出站选择
 
 | Caddyfile 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `allow_private_targets` | `false` | 是否允许私网、回环、链路本地等目标 |
-| `allow_cidr` / `deny_cidr` | 无 | 按解析后的目标 IP CIDR 放行或拒绝 |
-| `allow_port` / `deny_port` | 无 | 按目标端口放行或拒绝 |
-| `allow_domain` / `deny_domain` | 无 | 按域名或域名后缀放行或拒绝 |
-| `outbound <module> { ... }` | `direct` | 选择默认出站模块，决定认证后的目标流量从哪里发出 |
 | `outbound <name> <module> { ... }` | 无 | 声明一个具名出站，供 `user` 或 `default_outbound` 按名引用 |
-| `default_outbound <name>` | 无 | 未标注出站的用户使用的具名出站；不写时依次落到单 `outbound`、内置 `direct` |
+| `default_outbound <name>` | `direct` | 未标注出站的用户使用的具名出站；不写时使用内置 `direct` |
 
-策略规则：
-
-- `deny_*` 优先于 `allow_*`。
-- 配置任意 `allow_*` 后，未命中的对应目标会被拒绝。
-- 域名会先解析，再检查所有返回地址，随后只拨号已经检查过的 IP。
-- `allow_cidr` 可以精确放行默认私网保护下的受控网段。
-- 多个可用地址会在一个 `connect_timeout` 内交错尝试 IPv4/IPv6，而不是逐地址累加超时。
+用户识别成功后立即选择出站。`direct` 和 `socks5` 在本机解析 AnyTLS 会话，再把客户端请求的目标地址交给对应连接器；`anytls` 将完整会话转发给上游，由上游解析目标。模块不按域名、IP、端口或网络类型过滤目标。
 
 ### 用户与节点 URI
 
@@ -203,76 +180,102 @@ example.com {
 
 ## 出站 (outbound)
 
-认证通过后，目标流量默认由运行 Caddy 的这台机器直接发出（内置 `direct` 出站）。你也可以用 `outbound` 指令切换到其它出站模块，把出口流量转发到别处，例如经 WireGuard 隧道从另一台家宽服务器出站，用住宅 IP 出网。
+认证通过后，目标流量默认由运行 Caddy 的宿主机网络栈直接发出。仓库内置三种出站：
 
-WireGuard 的密钥、端点和隧道地址属于出口资源，应在 `caddy-wireguard` 的全局配置中集中定义；`anytls` 只引用该隧道：
+- `direct`：使用宿主机网络栈直连目标，是默认行为。
+- `socks5`：通过 SOCKS5 代理转发 TCP 和 UDP；目标域名交给 SOCKS5 代理解析。
+- `anytls`：识别本地用户后，将完整 AnyTLS 会话转发给另一个 AnyTLS 服务端；目标、DNS、TCP 和 UDP 均由上游处理。
 
-```caddyfile
-{
-	wireguard {
-		tunnel home {
-			private_key <base64 客户端私钥>
-			peer_public_key <base64 服务端公钥>
-			endpoint home.example.com:51820
-			address 10.7.0.2
-			allowed_ips 0.0.0.0/0 ::/0
-			dns 1.1.1.1
-			persistent_keepalive 25
-		}
-	}
-
-	servers :443 {
-		listener_wrappers {
-			anytls {
-				user phone-1 replace-with-strong-password
-				outbound wireguard {
-					tunnel home
-				}
-			}
-		}
-	}
-}
-```
-
-还可以声明多个具名出站，让不同账号走不同出口（客户端配置多个仅密码不同的节点即可切换）：
+例如，让指定用户通过 SOCKS5 出站：
 
 ```caddyfile
 anytls {
-	outbound wg-home wireguard {
-		tunnel home
+	outbound proxy socks5 {
+		address 127.0.0.1:1080
+		username proxy-user
+		password proxy-password
 	}
-	default_outbound wg-home
 
-	user phone-home replace-with-password-1 # -> 默认（wg-home）
-	user phone-direct replace-with-password-2 direct # -> 内置直连
+	user phone-direct replace-with-password-1
+	user phone-proxy replace-with-password-2 proxy
+}
+```
+
+`username` 和 `password` 可同时省略，表示不使用 SOCKS5 用户名密码认证。需要转发 UDP 时，SOCKS5 服务端必须支持 UDP ASSOCIATE。
+
+| `socks5` 配置 | 必填 | 说明 |
+| --- | --- | --- |
+| `address <host:port>` | 是 | SOCKS5 服务端地址 |
+| `username <value>` | 否 | SOCKS5 用户名；配置密码时必须同时配置用户名 |
+| `password <value>` | 否 | SOCKS5 密码 |
+
+例如，让指定用户把整条会话交给另一个 AnyTLS 节点：
+
+```caddyfile
+anytls {
+	outbound relay anytls {
+		address upstream.example.com:443
+		password upstream-password
+	}
+
+	user phone-direct replace-with-password-1
+	user phone-relay replace-with-password-2 relay
+}
+```
+
+入口会先使用 `phone-relay` 的本地密码识别并验证用户，再把会话开头的密码哈希替换成 `upstream-password` 对应的哈希。其余 padding 和 AnyTLS 会话帧不解析、不改写。`server_name` 默认从 `address` 的主机名推断，只有拨号地址与证书域名不同时才需要显式配置。
+
+| `anytls` 配置 | 必填 | 说明 |
+| --- | --- | --- |
+| `address <host:port>` | 是 | 上游 AnyTLS 服务端地址；仅该上游地址需要入口本地解析 |
+| `password <value>` | 是 | 上游 AnyTLS 服务端密码，可与本地用户密码不同 |
+| `server_name <value>` | 否 | 上游 TLS 的 SNI 与证书校验名；默认取 `address` 中的主机名 |
+| `tls_insecure_skip_verify` | 否 | 跳过上游证书校验，默认关闭；仅用于明确了解风险的测试环境 |
+
+所有非内置直连出口都先具名声明，再由 `default_outbound` 或用户引用。比如大多数用户走 AnyTLS 上游、个别用户仍然直连：
+
+```caddyfile
+anytls {
+	outbound relay anytls {
+		address upstream.example.com:443
+		password upstream-password
+	}
+	default_outbound relay
+
+	user phone-relay-1 replace-with-password-1
+	user phone-relay-2 replace-with-password-2
+	user phone-direct replace-with-password-3 direct
+}
+```
+
+自定义模块注册到 `caddy.listeners.anytls.outbounds` 命名空间后，也遵循相同的具名声明和引用方式。通用语法如下：
+
+```text
+anytls {
+    outbound <name> <module> {
+        <module-options>
+    }
+    default_outbound <name>
+
+    user <user-name> <password>
+    user <user-name> <password> <outbound-name>
+    user <user-name> <password> direct
 }
 ```
 
 - 出站模块注册在 `caddy.listeners.anytls.outbounds` 命名空间下。
-- 内置 `direct` 无需配置，是不写 `outbound` 时的默认行为；也可被 `user` 直接按名引用，无需声明。
-- 保留名 `direct` 和 `default` 不允许作为具名出站的名字；引用未声明的出站名会在配置阶段报错。
-- 未标注出站的用户按 `default_outbound` → 单 `outbound` → 内置 `direct` 的顺序解析默认出口，老配置行为不变。
-- 连接建立日志（`anytls connection established`）与节点日志带 `outbound` 字段，标注该连接/该账号实际使用的出站名。
-- 域名由认证用户实际选中的出站解析：`direct` 使用宿主机 DNS，隧道出站必须让 DNS 请求经过隧道。
-- 出站把解析结果返回 wrapper；wrapper 在拨号前完成私网、CIDR、端口和域名策略校验，然后通过同一出站连接已校验的 IP。
-- 推荐在全局块集中配置 WireGuard 隧道，再在 `anytls` 中通过 `tunnel <name>` 引用；这也允许 `reverse_proxy` 等其它模块安全共享同一个 device。
-- WireGuard 出站是一个独立仓库 [`github.com/lihuaye/caddy-wireguard`](https://github.com/lihuaye/caddy-wireguard)，用户态实现（wireguard-go + netstack），无需内核模块、TUN 设备或 root。构建方式：
-
-预构建镜像：
-
-```sh
-docker pull ghcr.io/evaneonf/caddy-anytls:wireguard
-```
-
-或自行构建：
-
-```sh
-xcaddy build \
-    --with github.com/evaneonf/caddy-anytls \
-    --with github.com/lihuaye/caddy-wireguard@v0.1.0
-```
-
-配置项、密钥生成和家宽侧准备见该仓库的 README。
+- 内置 `direct` 无需声明；未配置 `default_outbound` 时默认使用它，也可被 `user` 或 `default_outbound` 直接引用。
+- 内置 `socks5` 必须配置 `address <host:port>`，可选配置 `username` 与 `password`。
+- 内置 `anytls` 必须配置 `address <host:port>` 与上游 `password`，按需配置 `server_name`。
+- 保留名 `direct` 不允许作为具名出站的名字；引用未声明的出站名会在配置阶段报错。
+- 未标注出站的用户使用 `default_outbound`；未配置 `default_outbound` 时固定使用内置 `direct`。
+- 物理会话认证日志（`anytls session authenticated`）、本地目标连接日志（`anytls connection established`）与节点日志都带 `outbound` 字段。
+- `direct` 和 `socks5` 在本机处理 AnyTLS 子流：TCP 和 UDP-over-TCP 都把客户端请求的未解析目标地址交给选中的连接器。
+- `anytls` 是会话级出口：入口只识别用户和替换认证哈希，上游继续处理完整协议会话及其所有目标。
+- `direct` 依赖宿主机 DNS；`socks5` 由代理端解析目标域名；`anytls` 由最终上游解析目标域名。入口仍需解析 SOCKS5/AnyTLS 上游自身的地址。
+- 项目不维护额外的 DNS 缓存，DNS 缓存与 TTL 行为由宿主机或代理端负责。
+- AnyTLS 上游若再次把同一用户/会话转回当前节点会形成转发环路；协议没有 hop limit，部署时必须避免循环引用。
+- 其它出站仍可由第三方 Caddy 模块实现；模块的构建方式和配置项以其自身文档为准。
 
 ## 获取客户端 URI
 
@@ -302,7 +305,7 @@ URI 中包含完整密码。获取后应重新关闭 `log_node_info`，并避免
 
 如果未配置 `node_host`，模块会尝试从 Caddy 站点的 host matcher 推断；通配符和 placeholder 不会用于生成节点 URI。
 
-JSON 配置使用相应的复数数组字段，例如 `users`、`allow_cidrs`、`deny_ports`、`node_hosts`。完整示例见 [docs/examples.md](docs/examples.md)。
+JSON 配置使用相应的复数数组字段，例如 `users` 和 `node_hosts`。完整示例见 [docs/examples.md](docs/examples.md)。
 
 ## 运行行为与限制
 
@@ -310,7 +313,7 @@ JSON 配置使用相应的复数数组字段，例如 `users`、`allow_cidrs`、
 - AnyTLS 客户端在 TLS 后被模块接管。
 - `sp.v2.udp-over-tcp.arpa` 按 `UDP over TCP v2` 处理。
 - 已禁用用户命中 AnyTLS 首包时会被拒绝，不会回落网站。
-- UDP 目标解析在单条代理子流内缓存 30 秒，缓存最多保留 256 个目标。
+- UDP 目标域名由实际选中的出站解析，不使用项目级 DNS 缓存。
 - 配置 reload 或模块卸载会主动结束已有 AnyTLS 会话。
 - 一条 AnyTLS 会话复用单条 TCP，弱网丢包可能使该会话内的多个子流同时受队头阻塞；这是协议层限制。
 - 网站回落可以降低未认证主动探测特征，但不能隐藏 SNI、证书、客户端 TLS 指纹或所有流量时序特征。
@@ -328,7 +331,7 @@ JSON 配置使用相应的复数数组字段，例如 `users`、`allow_cidrs`、
 
 同一个 `connection_id` 可以对应多个目标地址，因为它标识底层 AnyTLS 会话，而不是单个复用子流。
 
-常见事件包括认证成功、网站 fallback、用户或策略拒绝、出站失败、relay 关闭和配置卸载。公网无效 TLS 握手仅记录为 Debug，避免扫描流量放大 Warn 日志；字节计数也只在 Debug 日志开启时采集。
+常见事件包括认证成功、网站 fallback、用户拒绝、出站失败、relay 关闭和配置卸载。公网无效 TLS 握手仅记录为 Debug，避免扫描流量放大 Warn 日志；字节计数也只在 Debug 日志开启时采集。
 
 ## 开发与验证
 

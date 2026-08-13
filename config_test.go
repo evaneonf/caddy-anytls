@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +17,7 @@ import (
 )
 
 func TestCaddyfileExamplesAreFormatted(t *testing.T) {
-	for _, path := range []string{"config/Caddyfile", "testdata/wireguard.Caddyfile"} {
+	for _, path := range []string{"config/Caddyfile"} {
 		input, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("os.ReadFile(%q) error = %v", path, err)
@@ -71,13 +70,6 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		max_streams_per_session 48
 		max_concurrent_streams 512
 		fallback true
-		allow_private_targets false
-		allow_cidr 10.0.0.0/8
-		deny_cidr 127.0.0.0/8
-		allow_port 443 8443
-		deny_port 25
-		allow_domain example.com .example.org
-		deny_domain blocked.example
 		log_node_info true
 		node_host example.com alt.example.com
 		node_port 8443
@@ -116,27 +108,6 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	if !wrapper.Fallback {
 		t.Fatal("Fallback = false, want true")
 	}
-	if wrapper.AllowPrivateTargets {
-		t.Fatal("AllowPrivateTargets = true, want false")
-	}
-	if strings.Join(wrapper.AllowCIDRs, ",") != "10.0.0.0/8" {
-		t.Fatalf("AllowCIDRs = %v, want 10.0.0.0/8", wrapper.AllowCIDRs)
-	}
-	if strings.Join(wrapper.DenyCIDRs, ",") != "127.0.0.0/8" {
-		t.Fatalf("DenyCIDRs = %v, want 127.0.0.0/8", wrapper.DenyCIDRs)
-	}
-	if !slices.Equal(wrapper.AllowPorts, []uint16{443, 8443}) {
-		t.Fatalf("AllowPorts = %v, want [443 8443]", wrapper.AllowPorts)
-	}
-	if !slices.Equal(wrapper.DenyPorts, []uint16{25}) {
-		t.Fatalf("DenyPorts = %v, want [25]", wrapper.DenyPorts)
-	}
-	if strings.Join(wrapper.AllowDomains, ",") != "example.com,.example.org" {
-		t.Fatalf("AllowDomains = %v, want example.com and .example.org", wrapper.AllowDomains)
-	}
-	if strings.Join(wrapper.DenyDomains, ",") != "blocked.example" {
-		t.Fatalf("DenyDomains = %v, want blocked.example", wrapper.DenyDomains)
-	}
 	if !wrapper.LogNodeInfo {
 		t.Fatal("LogNodeInfo = false, want true")
 	}
@@ -154,6 +125,34 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	}
 	if len(wrapper.Users) != 1 || wrapper.Users[0].Name != "alice" || wrapper.Users[0].Password != "secret" || !wrapper.Users[0].Enabled {
 		t.Fatalf("Users = %#v, want one enabled user", wrapper.Users)
+	}
+}
+
+func TestUnmarshalCaddyfileRejectsExtraScalarArguments(t *testing.T) {
+	directives := []string{
+		"probe_timeout 2s extra",
+		"idle_timeout 3m extra",
+		"connect_timeout 4s extra",
+		"max_concurrent 64 extra",
+		"max_pending_probes 96 extra",
+		"max_streams_per_session 48 extra",
+		"max_concurrent_streams 512 extra",
+		"fallback true extra",
+		"padding_scheme stop=8 extra",
+		"log_node_info true extra",
+		"node_port 8443 extra",
+		"node_sni example.com extra",
+		"node_insecure true extra",
+	}
+
+	for _, directive := range directives {
+		t.Run(strings.Fields(directive)[0], func(t *testing.T) {
+			dispenser := caddyfile.NewTestDispenser("anytls {\n" + directive + "\n}")
+			var wrapper ListenerWrapper
+			if err := wrapper.UnmarshalCaddyfile(dispenser); err == nil {
+				t.Fatalf("UnmarshalCaddyfile() accepted %q", directive)
+			}
+		})
 	}
 }
 
@@ -195,7 +194,7 @@ func TestUnmarshalJSONDefaults(t *testing.T) {
 		},
 		{
 			name:         "explicit false values are preserved",
-			input:        `{"fallback":false,"allow_cidrs":["10.0.0.0/8"],"deny_cidrs":["127.0.0.0/8"],"allow_ports":[443],"deny_ports":[25],"allow_domains":["example.com"],"deny_domains":["blocked.example"],"users":[{"name":"alice","password":"secret","enabled":false}]}`,
+			input:        `{"fallback":false,"users":[{"name":"alice","password":"secret","enabled":false}]}`,
 			wantFallback: false,
 			wantEnabled:  false,
 		},
@@ -215,17 +214,6 @@ func TestUnmarshalJSONDefaults(t *testing.T) {
 			}
 			if wrapper.Users[0].Enabled != tt.wantEnabled {
 				t.Fatalf("Users[0].Enabled = %v, want %v", wrapper.Users[0].Enabled, tt.wantEnabled)
-			}
-			if tt.name == "explicit false values are preserved" {
-				if strings.Join(wrapper.AllowCIDRs, ",") != "10.0.0.0/8" || strings.Join(wrapper.DenyCIDRs, ",") != "127.0.0.0/8" {
-					t.Fatalf("cidr policies were not decoded: allow=%v deny=%v", wrapper.AllowCIDRs, wrapper.DenyCIDRs)
-				}
-				if !slices.Equal(wrapper.AllowPorts, []uint16{443}) || !slices.Equal(wrapper.DenyPorts, []uint16{25}) {
-					t.Fatalf("port policies were not decoded: allow=%v deny=%v", wrapper.AllowPorts, wrapper.DenyPorts)
-				}
-				if strings.Join(wrapper.AllowDomains, ",") != "example.com" || strings.Join(wrapper.DenyDomains, ",") != "blocked.example" {
-					t.Fatalf("domain policies were not decoded: allow=%v deny=%v", wrapper.AllowDomains, wrapper.DenyDomains)
-				}
 			}
 		})
 	}
@@ -247,7 +235,6 @@ func TestCaddyfileAdapterIncludesAnyTLSListenerWrapper(t *testing.T) {
 				connect_timeout 10s
 				max_concurrent 64
 				fallback true
-				allow_private_targets false
 				user alice secret
 			}
 		}

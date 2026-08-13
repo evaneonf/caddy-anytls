@@ -2,7 +2,7 @@
 
 ## 概述
 
-仓库提供了用于本地构建和发布的容器文件，包括根目录下的 [Dockerfile](../Dockerfile) 与 [compose.yaml](../compose.yaml)。Dockerfile 提供两个镜像目标：只包含 `caddy-anytls` 的精简 `core`，以及额外包含 `caddy-wireguard` 的 `wireguard`。两者都以标准 Caddy 运行镜像作为最终运行环境。
+仓库提供了用于本地构建和发布的容器文件，包括根目录下的 [Dockerfile](../Dockerfile) 与 [compose.yaml](../compose.yaml)。镜像只包含 Caddy 和 `caddy-anytls`，并以标准 Caddy 运行镜像作为最终运行环境。
 
 ## 本地构建
 
@@ -12,21 +12,12 @@
 docker build -t caddy-anytls:local .
 ```
 
-不指定 target 时默认构建 `core`。构建 WireGuard 变体：
-
-```sh
-docker build --target wireguard -t caddy-anytls:wireguard-local .
-```
-
 当前镜像构建流程包括：
 
 - 构建阶段基于 [Dockerfile](../Dockerfile) 中的 `caddy:<version>-builder`
-- `core` 通过 `xcaddy` 将当前仓库模块编译进 `caddy`
-- `wireguard` 额外编译固定版本的 `github.com/lihuaye/caddy-wireguard`
+- 构建阶段通过 `xcaddy` 将当前仓库模块编译进 `caddy`
 - 运行阶段基于 [Dockerfile](../Dockerfile) 中的 `caddy:<version>`
 - Caddy 镜像版本应与 [go.mod](../go.mod) 中的 `github.com/caddyserver/caddy/v2` 保持一致，CI 会校验这一点
-
-WireGuard 版本由 Dockerfile 顶部唯一的 `CADDY_WIREGUARD_VERSION` ARG 管理。升级时修改该值并通过组合镜像检查，不要构建未固定版本的 `main`。
 
 ## 本地运行
 
@@ -40,7 +31,7 @@ WireGuard 版本由 Dockerfile 顶部唯一的 `CADDY_WIREGUARD_VERSION` ARG 管
 - 将示例域名替换为实际部署域名
 - 为 AnyTLS 用户设置强密码
 
-如需调整超时、并发、回落或私网目标策略，可参考 [examples.md](examples.md) 与 [README.md](../README.md)。
+如需调整超时、并发、回落或出站选择，可参考 [examples.md](examples.md) 与 [README.md](../README.md)。
 
 默认 [config/Caddyfile](../config/Caddyfile) 关闭 `log_node_info`，避免节点密码进入常规日志。只有在日志访问权限可控且确实需要输出节点 URI 时才临时开启；输出的 `uri` 字段包含完整密码。
 
@@ -57,7 +48,7 @@ docker compose up -d --build
 - `./config:/etc/caddy:ro`
 - `caddy_data:/data`
 
-其中 `/data` 与 `/config` 分别用于持久化 Caddy 数据和运行配置。
+其中 `./config` 是宿主机上手动维护的配置目录，`caddy_data` 用于持久化证书和私钥等 Caddy 数据。
 
 ## 自动发布
 
@@ -77,12 +68,12 @@ docker compose up -d --build
 
 工作流的发布策略如下：
 
-- Pull Request 执行代码检查，并构建一次 amd64 WireGuard smoke 镜像，验证插件注册与 Caddyfile 适配；不会推送镜像
+- Pull Request 执行代码检查，并构建一次 amd64 smoke 镜像，验证模块注册与 Caddyfile 适配；不会推送镜像
 - `main` push 只执行轻量代码检查
-- 定时运行会执行完整检查，并且仅在 Docker 或 Go 输入有变化时推送 `main` 与 `main-wireguard` 镜像
-- 手动触发会执行完整检查并推送两个 flavor
-- `v*` tag 会执行完整检查、推送两个 flavor 的版本镜像，并更新 `latest` 与 `wireguard`
-- 两个 flavor 的发布目标架构均为 `linux/amd64` 和 `linux/arm64`
+- 定时运行会执行完整检查，并且仅在 Docker 或 Go 输入有变化时推送 `main` 镜像
+- 手动触发会执行完整检查并推送镜像
+- `v*` tag 会执行完整检查、推送版本镜像并更新 `latest`
+- 发布目标架构为 `linux/amd64` 和 `linux/arm64`
 - 使用 GitHub Actions 缓存加速 `buildx` 构建
 
 ## 镜像地址与标签
@@ -99,12 +90,7 @@ ghcr.io/<owner>/<repo>
 ghcr.io/evaneonf/caddy-anytls
 ```
 
-当前标签策略如下：
-
-| flavor | 分支/定时标签 | Git tag | 滚动标签 |
-| --- | --- | --- | --- |
-| core | `main` | `vX.Y.Z` | `latest` |
-| wireguard | `main-wireguard` | `vX.Y.Z-wireguard` | `wireguard` |
+当前标签策略为：分支和定时发布使用 `main`，Git tag 发布使用 `vX.Y.Z`，正式版本同时更新滚动标签 `latest`。
 
 ## 发布前提
 

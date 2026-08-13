@@ -2,6 +2,7 @@ package anytls
 
 import (
 	"encoding/json"
+	"errors"
 	"strconv"
 	"time"
 
@@ -41,42 +42,30 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			lw.ConnectTimeout = caddy.Duration(dur)
 
 		case "max_concurrent":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			value, err := strconv.Atoi(d.Val())
+			value, err := parseIntDirective(d, "max_concurrent")
 			if err != nil {
-				return d.Errf("parsing max_concurrent: %v", err)
+				return err
 			}
 			lw.MaxConcurrent = value
 
 		case "max_pending_probes":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			value, err := strconv.Atoi(d.Val())
+			value, err := parseIntDirective(d, "max_pending_probes")
 			if err != nil {
-				return d.Errf("parsing max_pending_probes: %v", err)
+				return err
 			}
 			lw.MaxPendingProbes = value
 
 		case "max_streams_per_session":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			value, err := strconv.Atoi(d.Val())
+			value, err := parseIntDirective(d, "max_streams_per_session")
 			if err != nil {
-				return d.Errf("parsing max_streams_per_session: %v", err)
+				return err
 			}
 			lw.MaxStreamsPerSession = value
 
 		case "max_concurrent_streams":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			value, err := strconv.Atoi(d.Val())
+			value, err := parseIntDirective(d, "max_concurrent_streams")
 			if err != nil {
-				return d.Errf("parsing max_concurrent_streams: %v", err)
+				return err
 			}
 			lw.MaxConcurrentStreams = value
 
@@ -88,60 +77,12 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			lw.Fallback = value
 			lw.fallbackSet = true
 
-		case "allow_private_targets":
-			value, err := parseBoolDirective(d, "allow_private_targets")
-			if err != nil {
-				return err
-			}
-			lw.AllowPrivateTargets = value
-
-		case "allow_cidr":
-			values := d.RemainingArgs()
-			if len(values) == 0 {
-				return d.ArgErr()
-			}
-			lw.AllowCIDRs = append(lw.AllowCIDRs, values...)
-
-		case "deny_cidr":
-			values := d.RemainingArgs()
-			if len(values) == 0 {
-				return d.ArgErr()
-			}
-			lw.DenyCIDRs = append(lw.DenyCIDRs, values...)
-
-		case "allow_port":
-			values, err := parsePortListDirective(d, "allow_port")
-			if err != nil {
-				return err
-			}
-			lw.AllowPorts = append(lw.AllowPorts, values...)
-
-		case "deny_port":
-			values, err := parsePortListDirective(d, "deny_port")
-			if err != nil {
-				return err
-			}
-			lw.DenyPorts = append(lw.DenyPorts, values...)
-
-		case "allow_domain":
-			values := d.RemainingArgs()
-			if len(values) == 0 {
-				return d.ArgErr()
-			}
-			lw.AllowDomains = append(lw.AllowDomains, values...)
-
-		case "deny_domain":
-			values := d.RemainingArgs()
-			if len(values) == 0 {
-				return d.ArgErr()
-			}
-			lw.DenyDomains = append(lw.DenyDomains, values...)
-
 		case "padding_scheme":
-			if !d.NextArg() {
-				return d.ArgErr()
+			value, err := parseStringDirective(d)
+			if err != nil {
+				return err
 			}
-			lw.PaddingScheme = d.Val()
+			lw.PaddingScheme = value
 
 		case "log_node_info":
 			value, err := parseBoolDirective(d, "log_node_info")
@@ -158,20 +99,18 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			lw.NodeHosts = append(lw.NodeHosts, values...)
 
 		case "node_port":
-			values, err := parsePortListDirective(d, "node_port")
+			value, err := parsePortDirective(d, "node_port")
 			if err != nil {
 				return err
 			}
-			if len(values) != 1 {
-				return d.Errf("node_port expects exactly one port")
-			}
-			lw.NodePort = values[0]
+			lw.NodePort = value
 
 		case "node_sni":
-			if !d.NextArg() {
-				return d.ArgErr()
+			value, err := parseStringDirective(d)
+			if err != nil {
+				return err
 			}
-			lw.NodeSNI = d.Val()
+			lw.NodeSNI = value
 
 		case "node_insecure":
 			value, err := parseBoolDirective(d, "node_insecure")
@@ -196,45 +135,28 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			lw.Users = append(lw.Users, user)
 
 		case "outbound":
-			// Disambiguated by argument count using nested NextArg:
-			//   outbound <module> {...}        -> default outbound (OutboundRaw)
-			//   outbound <name> <module> {...} -> named outbound (OutboundsRaw)
-			// In both forms the cursor stays on the module-name token, which is
-			// what UnmarshalModule expects as the start of its segment.
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
-			firstArg := d.Val()
-			if d.NextArg() {
-				// Named form: firstArg is the outbound name.
-				outboundName := firstArg
-				moduleName := d.Val()
-				if outboundName == "" {
-					return d.Errf("named outbound must not have an empty name")
-				}
-				if _, ok := lw.OutboundsRaw[outboundName]; ok {
-					return d.Errf("outbound %q may only be declared once", outboundName)
-				}
-				raw, err := unmarshalOutboundModule(d, moduleName)
-				if err != nil {
-					return err
-				}
-				if lw.OutboundsRaw == nil {
-					lw.OutboundsRaw = make(map[string]json.RawMessage)
-				}
-				lw.OutboundsRaw[outboundName] = raw
-			} else {
-				// Default form: firstArg is the module name. Only the unnamed
-				// form is limited to a single occurrence.
-				if len(lw.OutboundRaw) != 0 {
-					return d.Errf("outbound may only be specified once")
-				}
-				raw, err := unmarshalOutboundModule(d, firstArg)
-				if err != nil {
-					return err
-				}
-				lw.OutboundRaw = raw
+			outboundName := d.Val()
+			if !d.NextArg() {
+				return d.ArgErr()
 			}
+			moduleName := d.Val()
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			if _, ok := lw.OutboundsRaw[outboundName]; ok {
+				return d.Errf("outbound %q may only be declared once", outboundName)
+			}
+			raw, err := unmarshalOutboundModule(d, moduleName)
+			if err != nil {
+				return err
+			}
+			if lw.OutboundsRaw == nil {
+				lw.OutboundsRaw = make(map[string]json.RawMessage)
+			}
+			lw.OutboundsRaw[outboundName] = raw
 
 		case "default_outbound":
 			if lw.DefaultOutbound != "" {
@@ -287,20 +209,12 @@ func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 		MaxStreamsPerSession int                        `json:"max_streams_per_session,omitempty"`
 		MaxConcurrentStreams int                        `json:"max_concurrent_streams,omitempty"`
 		Fallback             bool                       `json:"fallback,omitempty"`
-		AllowPrivateTargets  bool                       `json:"allow_private_targets,omitempty"`
-		AllowCIDRs           []string                   `json:"allow_cidrs,omitempty"`
-		DenyCIDRs            []string                   `json:"deny_cidrs,omitempty"`
-		AllowPorts           []uint16                   `json:"allow_ports,omitempty"`
-		DenyPorts            []uint16                   `json:"deny_ports,omitempty"`
-		AllowDomains         []string                   `json:"allow_domains,omitempty"`
-		DenyDomains          []string                   `json:"deny_domains,omitempty"`
 		PaddingScheme        string                     `json:"padding_scheme,omitempty"`
 		LogNodeInfo          bool                       `json:"log_node_info,omitempty"`
 		NodeHosts            []string                   `json:"node_hosts,omitempty"`
 		NodePort             uint16                     `json:"node_port,omitempty"`
 		NodeSNI              string                     `json:"node_sni,omitempty"`
 		NodeInsecure         bool                       `json:"node_insecure,omitempty"`
-		OutboundRaw          json.RawMessage            `json:"outbound,omitempty"`
 		OutboundsRaw         map[string]json.RawMessage `json:"outbounds,omitempty"`
 		DefaultOutbound      string                     `json:"default_outbound,omitempty"`
 	}
@@ -316,26 +230,21 @@ func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 	lw.MaxStreamsPerSession = config.MaxStreamsPerSession
 	lw.MaxConcurrentStreams = config.MaxConcurrentStreams
 	lw.Fallback = config.Fallback
-	lw.AllowPrivateTargets = config.AllowPrivateTargets
-	lw.AllowCIDRs = config.AllowCIDRs
-	lw.DenyCIDRs = config.DenyCIDRs
-	lw.AllowPorts = config.AllowPorts
-	lw.DenyPorts = config.DenyPorts
-	lw.AllowDomains = config.AllowDomains
-	lw.DenyDomains = config.DenyDomains
 	lw.PaddingScheme = config.PaddingScheme
 	lw.LogNodeInfo = config.LogNodeInfo
 	lw.NodeHosts = config.NodeHosts
 	lw.NodePort = config.NodePort
 	lw.NodeSNI = config.NodeSNI
 	lw.NodeInsecure = config.NodeInsecure
-	lw.OutboundRaw = config.OutboundRaw
 	lw.OutboundsRaw = config.OutboundsRaw
 	lw.DefaultOutbound = config.DefaultOutbound
 
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
+	}
+	if _, ok := raw["outbound"]; ok {
+		return errors.New("JSON field \"outbound\" is not supported; declare a named entry in \"outbounds\" and select it with \"default_outbound\"")
 	}
 	if _, ok := raw["fallback"]; ok {
 		lw.fallbackSet = true
@@ -366,10 +275,11 @@ func (u *User) UnmarshalJSON(data []byte) error {
 }
 
 func parseDurationDirective(d *caddyfile.Dispenser, name string) (time.Duration, error) {
-	if !d.NextArg() {
-		return 0, d.ArgErr()
+	value, err := parseStringDirective(d)
+	if err != nil {
+		return 0, err
 	}
-	dur, err := caddy.ParseDuration(d.Val())
+	dur, err := caddy.ParseDuration(value)
 	if err != nil {
 		return 0, d.Errf("parsing %s duration: %v", name, err)
 	}
@@ -377,28 +287,48 @@ func parseDurationDirective(d *caddyfile.Dispenser, name string) (time.Duration,
 }
 
 func parseBoolDirective(d *caddyfile.Dispenser, name string) (bool, error) {
-	if !d.NextArg() {
-		return false, d.ArgErr()
+	rawValue, err := parseStringDirective(d)
+	if err != nil {
+		return false, err
 	}
-	value, err := strconv.ParseBool(d.Val())
+	value, err := strconv.ParseBool(rawValue)
 	if err != nil {
 		return false, d.Errf("parsing %s boolean: %v", name, err)
 	}
 	return value, nil
 }
 
-func parsePortListDirective(d *caddyfile.Dispenser, name string) ([]uint16, error) {
-	args := d.RemainingArgs()
-	if len(args) == 0 {
-		return nil, d.ArgErr()
+func parseIntDirective(d *caddyfile.Dispenser, name string) (int, error) {
+	rawValue, err := parseStringDirective(d)
+	if err != nil {
+		return 0, err
 	}
-	ports := make([]uint16, 0, len(args))
-	for _, arg := range args {
-		value, err := strconv.ParseUint(arg, 10, 16)
-		if err != nil || value == 0 {
-			return nil, d.Errf("parsing %s port %q: must be between 1 and 65535", name, arg)
-		}
-		ports = append(ports, uint16(value))
+	value, err := strconv.Atoi(rawValue)
+	if err != nil {
+		return 0, d.Errf("parsing %s: %v", name, err)
 	}
-	return ports, nil
+	return value, nil
+}
+
+func parsePortDirective(d *caddyfile.Dispenser, name string) (uint16, error) {
+	rawValue, err := parseStringDirective(d)
+	if err != nil {
+		return 0, err
+	}
+	value, err := strconv.ParseUint(rawValue, 10, 16)
+	if err != nil || value == 0 {
+		return 0, d.Errf("parsing %s port %q: must be between 1 and 65535", name, rawValue)
+	}
+	return uint16(value), nil
+}
+
+func parseStringDirective(d *caddyfile.Dispenser) (string, error) {
+	if !d.NextArg() {
+		return "", d.ArgErr()
+	}
+	value := d.Val()
+	if d.NextArg() {
+		return "", d.ArgErr()
+	}
+	return value, nil
 }

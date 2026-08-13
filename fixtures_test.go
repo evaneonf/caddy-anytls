@@ -11,7 +11,6 @@ import (
 	"io"
 	"math/big"
 	"net"
-	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -24,38 +23,27 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-// testResolvedDestinationAddress is what fixtures expect their dialFunc to
-// receive for a :443 domain destination resolved through resolveTestDomain:
-// destinations are always resolved and policy-checked before dialing through
-// the outbound, even on the allow_private_targets fast path.
-const testResolvedDestinationAddress = "192.0.2.10:443"
-
-func resolveTestDomain(context.Context, string, string) ([]netip.Addr, error) {
-	return []netip.Addr{netip.MustParseAddr("192.0.2.10")}, nil
-}
-
-func newTestWrapper(t *testing.T, users []User, allowPrivateTargets bool) *ListenerWrapper {
+func newTestWrapper(t *testing.T, users []User) *ListenerWrapper {
 	t.Helper()
 
 	wrapper := &ListenerWrapper{
-		Users:               users,
-		ProbeTimeout:        caddy.Duration(250 * time.Millisecond),
-		IdleTimeout:         caddy.Duration(2 * time.Second),
-		ConnectTimeout:      caddy.Duration(time.Second),
-		MaxConcurrent:       8,
-		Fallback:            true,
-		AllowPrivateTargets: allowPrivateTargets,
-		PaddingScheme:       string(padding.DefaultPaddingScheme),
-		logger:              zap.NewNop(),
-		registry:            newSessionRegistry(),
-		outbound:            new(DirectOutbound),
+		Users:            users,
+		ProbeTimeout:     caddy.Duration(250 * time.Millisecond),
+		IdleTimeout:      caddy.Duration(2 * time.Second),
+		ConnectTimeout:   caddy.Duration(time.Second),
+		MaxConcurrent:    8,
+		Fallback:         true,
+		PaddingScheme:    string(padding.DefaultPaddingScheme),
+		logger:           zap.NewNop(),
+		registry:         newSessionRegistry(),
+		defaultSelection: outboundSelection{outbound: new(DirectOutbound), name: reservedOutboundDirect},
 	}
-	wrapper.detector = NewPasswordHashDetector(wrapper.Users)
+	wrapper.detector = newPasswordHashDetector(wrapper.Users)
 
 	service, err := singanytls.NewService(singanytls.ServiceConfig{
 		PaddingScheme: []byte(wrapper.PaddingScheme),
 		Users:         wrapper.anyTLSUsers(),
-		Handler:       &directTCPHandler{config: wrapper},
+		Handler:       &proxyHandler{config: wrapper},
 		Logger:        zapLogger{base: wrapper.logger},
 	})
 	if err != nil {
@@ -143,6 +131,12 @@ func waitForLogs(logs *observer.ObservedLogs, message string) bool {
 	})
 }
 
+func testActiveSessionCount(wrapper *ListenerWrapper) int {
+	wrapper.registry.mu.Lock()
+	defer wrapper.registry.mu.Unlock()
+	return len(wrapper.registry.sessions)
+}
+
 func waitForCondition(timeout time.Duration, fn func() bool) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -186,6 +180,29 @@ func (c *handshakeReportConn) HandshakeSuccess() error {
 
 type anyTLSTestDialer struct {
 	client *singanytls.Client
+}
+
+type testOutbound struct {
+	dial func(context.Context, M.Socksaddr) (net.Conn, error)
+	open func(context.Context) (PacketConn, error)
+}
+
+func (o *testOutbound) HandleSession(_ context.Context, session *OutboundSession) error {
+	return session.ServeLocal(o)
+}
+
+func (o *testOutbound) DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+	if o.dial == nil {
+		return nil, errors.New("TCP outbound not configured for test")
+	}
+	return o.dial(ctx, destination)
+}
+
+func (o *testOutbound) OpenPacket(ctx context.Context) (PacketConn, error) {
+	if o.open == nil {
+		return nil, errors.New("UDP outbound not configured for test")
+	}
+	return o.open(ctx)
 }
 
 func (d anyTLSTestDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -311,6 +328,22 @@ type packetConn struct {
 	recvCh    chan packetPayload
 	closed    chan struct{}
 	once      sync.Once
+}
+
+// packetConnAdapter preserves domain destinations in tests. It models the
+// domain-aware PacketConn contract without invoking the host resolver.
+type packetConnAdapter struct {
+	net.PacketConn
+}
+
+func (c *packetConnAdapter) ReadPacket(p []byte) (int, M.Socksaddr, error) {
+	n, source, err := c.ReadFrom(p)
+	return n, M.SocksaddrFromNet(source), err
+}
+
+func (c *packetConnAdapter) WritePacket(p []byte, destination M.Socksaddr) error {
+	_, err := c.WriteTo(p, destination)
+	return err
 }
 
 func newPacketPipe() (*packetConn, *packetConn) {

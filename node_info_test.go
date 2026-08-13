@@ -99,14 +99,13 @@ func TestLogNodeInfoIncludesOutboundNames(t *testing.T) {
 	core, logs := observer.New(zapcore.InfoLevel)
 	wrapper := &ListenerWrapper{
 		Users: []User{
-			{Name: "alice", Password: "alice-pass", Enabled: true, Outbound: "wg-home"},
+			{Name: "alice", Password: "alice-pass", Enabled: true, Outbound: "exit-home"},
 			{Name: "bob", Password: "bob-pass", Enabled: true},
 		},
-		LogNodeInfo:         true,
-		NodeHosts:           []string{"example.com"},
-		logger:              zap.New(core),
-		defaultOutbound:     new(DirectOutbound),
-		defaultOutboundName: "wg-default",
+		LogNodeInfo:      true,
+		NodeHosts:        []string{"example.com"},
+		logger:           zap.New(core),
+		defaultSelection: outboundSelection{outbound: new(DirectOutbound), name: "exit-default"},
 	}
 
 	wrapper.logNodeInfo(nil)
@@ -116,8 +115,8 @@ func TestLogNodeInfoIncludesOutboundNames(t *testing.T) {
 		t.Fatalf("node log count = %d, want 2", len(entries))
 	}
 	want := map[string]string{
-		"alice": "wg-home",
-		"bob":   "wg-default",
+		"alice": "exit-home",
+		"bob":   "exit-default",
 	}
 	for _, entry := range entries {
 		fields := entry.ContextMap()

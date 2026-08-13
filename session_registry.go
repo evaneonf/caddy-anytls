@@ -54,12 +54,6 @@ func (lw *ListenerWrapper) unregisterSession(connectionID uint64) {
 	delete(lw.registry.sessions, connectionID)
 }
 
-func (lw *ListenerWrapper) activeSessionCount() int {
-	lw.registry.mu.Lock()
-	defer lw.registry.mu.Unlock()
-	return len(lw.registry.sessions)
-}
-
 func (lw *ListenerWrapper) acquireSessionStream(connectionID uint64) bool {
 	lw.registry.mu.Lock()
 	defer lw.registry.mu.Unlock()
@@ -86,29 +80,38 @@ func (lw *ListenerWrapper) closeActiveSessions(reason string) {
 	lw.registry.mu.Lock()
 	snapshots := make([]struct {
 		connectionID uint64
-		session      *activeSession
+		cancel       context.CancelFunc
+		conn         net.Conn
+		startedAt    time.Time
+		user         string
 	}, 0, len(lw.registry.sessions))
 	for connectionID, session := range lw.registry.sessions {
 		snapshots = append(snapshots, struct {
 			connectionID uint64
-			session      *activeSession
+			cancel       context.CancelFunc
+			conn         net.Conn
+			startedAt    time.Time
+			user         string
 		}{
 			connectionID: connectionID,
-			session:      session,
+			cancel:       session.cancel,
+			conn:         session.conn,
+			startedAt:    session.startedAt,
+			user:         session.user,
 		})
 	}
 	lw.registry.mu.Unlock()
 
 	for _, item := range snapshots {
-		item.session.cancel()
-		_ = item.session.conn.Close()
+		item.cancel()
+		_ = item.conn.Close()
 		lw.logger.Info("anytls session terminated",
 			zap.Uint64("connection_id", item.connectionID),
 			zap.String("event", "anytls_session"),
 			zap.String("outcome", "terminated"),
 			zap.String("reason", reason),
-			zap.String("user", item.session.user),
-			zap.Duration("duration", time.Since(item.session.startedAt)),
+			zap.String("user", item.user),
+			zap.Duration("duration", time.Since(item.startedAt)),
 		)
 	}
 }

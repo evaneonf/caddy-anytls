@@ -10,7 +10,6 @@ on:
       - "Dockerfile"
       - ".dockerignore"
       - ".github/workflows/docker.yml"
-      - "testdata/wireguard.Caddyfile"
       - "go.mod"
       - "go.sum"
       - "**/*.go"
@@ -19,7 +18,6 @@ on:
       - "Dockerfile"
       - ".dockerignore"
       - ".github/workflows/docker.yml"
-      - "testdata/wireguard.Caddyfile"
       - "go.mod"
       - "go.sum"
       - "**/*.go"
@@ -53,7 +51,7 @@ jobs:
 
           module_version="$(go list -m -f '{{ .Version }}' github.com/caddyserver/caddy/v2)"
           builder_version="$(sed -n 's/^FROM caddy:\([0-9][^- ]*\)-builder AS builder$/\1/p' Dockerfile)"
-          runtime_version="$(sed -n 's/^FROM caddy:\([0-9][^ ]*\) AS runtime$/\1/p' Dockerfile)"
+          runtime_version="$(sed -n 's/^FROM caddy:\([0-9][^ ]*\)$/\1/p' Dockerfile)"
 
           if [ -z "$builder_version" ] || [ -z "$runtime_version" ]; then
             echo "Could not parse Caddy image versions from Dockerfile" >&2
@@ -91,7 +89,7 @@ jobs:
         uses: golangci/golangci-lint-action@v9
 
   docker-smoke:
-    name: Docker (wireguard smoke)
+    name: Docker smoke
     needs: go
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -103,27 +101,29 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build WireGuard image
+      - name: Build image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
-          target: wireguard
           platforms: linux/amd64
           load: true
-          tags: caddy-anytls:wireguard-smoke
-          cache-from: type=gha,scope=docker-smoke-wireguard-amd64
-          cache-to: type=gha,mode=max,scope=docker-smoke-wireguard-amd64
+          tags: caddy-anytls:smoke
+          cache-from: type=gha,scope=docker-smoke-amd64
+          cache-to: type=gha,mode=max,scope=docker-smoke-amd64
 
-      - name: Verify WireGuard module and Caddyfile adapter
+      - name: Verify module and Caddyfile adapter
         run: |
           set -euo pipefail
 
-          docker run --rm caddy-anytls:wireguard-smoke caddy list-modules \
-            | grep -Fx 'caddy.listeners.anytls.outbounds.wireguard'
+          modules="$(docker run --rm caddy-anytls:smoke caddy list-modules)"
+          grep -Fx 'caddy.listeners.anytls' <<< "$modules"
+          grep -Fx 'caddy.listeners.anytls.outbounds.direct' <<< "$modules"
+          grep -Fx 'caddy.listeners.anytls.outbounds.socks5' <<< "$modules"
+          grep -Fx 'caddy.listeners.anytls.outbounds.anytls' <<< "$modules"
           docker run --rm \
-            -v "$GITHUB_WORKSPACE/testdata/wireguard.Caddyfile:/etc/caddy/Caddyfile:ro" \
-            caddy-anytls:wireguard-smoke \
+            -v "$GITHUB_WORKSPACE/config/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy-anytls:smoke \
             caddy adapt --adapter caddyfile --config /etc/caddy/Caddyfile >/dev/null
 
   docker-prepare:
@@ -179,7 +179,6 @@ jobs:
               Dockerfile \
               .dockerignore \
               .github/workflows/docker.yml \
-              testdata/wireguard.Caddyfile \
               go.mod \
               go.sum \
               ':(glob)**/*.go'; then
@@ -198,7 +197,7 @@ jobs:
           echo "$reason"
 
   docker-build:
-    name: Docker (${{ matrix.flavor }}, ${{ matrix.platform }})
+    name: Docker (${{ matrix.platform }})
     needs: docker-prepare
     if: needs.docker-prepare.outputs.push == 'true'
     runs-on: ${{ matrix.runner }}
@@ -209,27 +208,9 @@ jobs:
           - platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-            flavor: core
-            tag_suffix: ""
-            rolling_tag: latest
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
-            flavor: core
-            tag_suffix: ""
-            rolling_tag: latest
-          - platform: linux/amd64
-            runner: ubuntu-24.04
-            arch: amd64
-            flavor: wireguard
-            tag_suffix: -wireguard
-            rolling_tag: wireguard
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            arch: arm64
-            flavor: wireguard
-            tag_suffix: -wireguard
-            rolling_tag: wireguard
     permissions:
       actions: read
       contents: read
@@ -255,9 +236,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch,suffix=${{ matrix.tag_suffix }}
-            type=ref,event=tag,suffix=${{ matrix.tag_suffix }}
-            type=raw,value=${{ matrix.rolling_tag }},enable=${{ github.ref_type == 'tag' }}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
       - name: Build and push
         id: build
@@ -265,32 +246,25 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          target: ${{ matrix.flavor }}
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=docker-${{ matrix.flavor }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=docker-${{ matrix.flavor }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
 
       - name: Verify image modules
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          FLAVOR: ${{ matrix.flavor }}
         run: |
           set -euo pipefail
 
           image="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
           docker pull "$image"
-          docker run --rm "$image" caddy list-modules \
-            | grep -Fx 'caddy.listeners.anytls'
-          if [ "$FLAVOR" = "wireguard" ]; then
-            docker run --rm "$image" caddy list-modules \
-              | grep -Fx 'caddy.listeners.anytls.outbounds.wireguard'
-            docker run --rm \
-              -v "$GITHUB_WORKSPACE/testdata/wireguard.Caddyfile:/etc/caddy/Caddyfile:ro" \
-              "$image" \
-              caddy adapt --adapter caddyfile --config /etc/caddy/Caddyfile >/dev/null
-          fi
+          modules="$(docker run --rm "$image" caddy list-modules)"
+          grep -Fx 'caddy.listeners.anytls' <<< "$modules"
+          grep -Fx 'caddy.listeners.anytls.outbounds.direct' <<< "$modules"
+          grep -Fx 'caddy.listeners.anytls.outbounds.socks5' <<< "$modules"
+          grep -Fx 'caddy.listeners.anytls.outbounds.anytls' <<< "$modules"
 
       - name: Export digest
         env:
@@ -302,25 +276,15 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v7
         with:
-          name: digests-${{ matrix.flavor }}-${{ matrix.arch }}
+          name: digests-${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
   docker-merge:
-    name: Docker manifest (${{ matrix.flavor }})
+    name: Docker manifest
     needs: docker-build
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - flavor: core
-            tag_suffix: ""
-            rolling_tag: latest
-          - flavor: wireguard
-            tag_suffix: -wireguard
-            rolling_tag: wireguard
     permissions:
       actions: read
       contents: read
@@ -331,7 +295,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
-          pattern: digests-${{ matrix.flavor }}-*
+          pattern: digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -350,9 +314,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch,suffix=${{ matrix.tag_suffix }}
-            type=ref,event=tag,suffix=${{ matrix.tag_suffix }}
-            type=raw,value=${{ matrix.rolling_tag }},enable=${{ github.ref_type == 'tag' }}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
       - name: Create and push manifest
         env:
@@ -409,22 +373,13 @@ jobs:
           {
             echo "## Container images"
             echo
-            echo "### Core"
-            echo
             echo '```sh'
             echo "docker pull ${IMAGE}:${TAG}"
-            echo '```'
-            echo
-            echo "### WireGuard"
-            echo
-            echo '```sh'
-            echo "docker pull ${IMAGE}:${TAG}-wireguard"
             echo '```'
             echo
             echo "Rolling tags:"
             echo
             echo "- \`${IMAGE}:latest\`"
-            echo "- \`${IMAGE}:wireguard\`"
             echo
             echo "## Changes"
             echo

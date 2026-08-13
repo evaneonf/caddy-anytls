@@ -9,8 +9,7 @@
 - 可通过 `xcaddy` 构建
 - 支持 Caddyfile `listener_wrappers` 配置
 - 已接入 `sing-anytls` 协议实现
-- 已覆盖网站 fallback、AnyTLS 转发、UDP over TCP、禁用用户拒绝、出站策略和配置卸载会话终止等关键测试
-- 支持端口、域名和 CIDR 出站策略
+- 已覆盖网站 fallback、AnyTLS 转发、UDP over TCP、禁用用户拒绝、按用户选择出站和配置卸载会话终止等关键测试
 - 支持启动或重载后在 Caddy 日志输出当前可用 AnyTLS 节点 URI
 
 ## 对外说明建议
@@ -21,8 +20,7 @@
 - 网站与 AnyTLS 共用同一 `443` 入口
 - 非 AnyTLS 流量继续进入网站链路
 - 已禁用用户命中的新连接会被拒绝
-- 默认拒绝私网目标，并会检查域名解析后的所有地址
-- 出站 `deny_*` 策略优先于 `allow_*` 策略
+- 认证成功后，客户端目标直接交给选中的出站
 - 配置重载或卸载时，已有 AnyTLS 会话会被终止
 
 这些行为属于当前版本的重要边界，发布文案应保持一致。
@@ -38,8 +36,8 @@
 - 确认 `staticcheck ./...` 通过
 - 确认 `golangci-lint run` 通过
 - 确认 `go mod verify` 通过
-- 确认 `core` 与 `wireguard` Docker targets 都能构建
-- 确认 WireGuard 镜像包含 `caddy.listeners.anytls.outbounds.wireguard`，并能适配测试 Caddyfile
+- 确认 Docker 镜像能构建并包含 `caddy.listeners.anytls`
+- 确认示例 Caddyfile 能由镜像正确适配
 - 确认许可证文件与仓库说明一致
 - 确认文档没有承诺当前尚未实现的能力
 
@@ -52,20 +50,18 @@ git tag -a vX.Y.Z -m "Release vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-标签触发完整检查，并构建 `linux/amd64`、`linux/arm64` 的 `core` 与 `wireguard` 镜像。两个多架构 manifest 都发布成功后，工作流才会创建 GitHub Release；Release 说明包含固定版本镜像、滚动标签以及从上一个版本起的提交列表。工作流重跑时不会重复创建已经存在的 Release。
+标签触发完整检查，并构建 `linux/amd64`、`linux/arm64` 镜像。多架构 manifest 发布成功后，工作流才会创建 GitHub Release；Release 说明包含固定版本镜像、滚动标签以及从上一个版本起的提交列表。工作流重跑时不会重复创建已经存在的 Release。
 
 版本标签对应的镜像如下：
 
 ```text
 ghcr.io/evaneonf/caddy-anytls:vX.Y.Z
-ghcr.io/evaneonf/caddy-anytls:vX.Y.Z-wireguard
 ```
 
 成功发布版本标签时还会更新：
 
 ```text
 ghcr.io/evaneonf/caddy-anytls:latest
-ghcr.io/evaneonf/caddy-anytls:wireguard
 ```
 
 ## 当前边界

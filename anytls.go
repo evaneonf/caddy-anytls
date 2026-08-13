@@ -4,15 +4,12 @@
 package anytls
 
 import (
-	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
-	"slices"
 	"sync/atomic"
 	"time"
 
@@ -41,13 +38,6 @@ type ListenerWrapper struct {
 	MaxStreamsPerSession int            `json:"max_streams_per_session,omitempty"`
 	MaxConcurrentStreams int            `json:"max_concurrent_streams,omitempty"`
 	Fallback             bool           `json:"fallback,omitempty"`
-	AllowPrivateTargets  bool           `json:"allow_private_targets,omitempty"`
-	AllowCIDRs           []string       `json:"allow_cidrs,omitempty"`
-	DenyCIDRs            []string       `json:"deny_cidrs,omitempty"`
-	AllowPorts           []uint16       `json:"allow_ports,omitempty"`
-	DenyPorts            []uint16       `json:"deny_ports,omitempty"`
-	AllowDomains         []string       `json:"allow_domains,omitempty"`
-	DenyDomains          []string       `json:"deny_domains,omitempty"`
 	PaddingScheme        string         `json:"padding_scheme,omitempty"`
 	LogNodeInfo          bool           `json:"log_node_info,omitempty"`
 	NodeHosts            []string       `json:"node_hosts,omitempty"`
@@ -55,41 +45,32 @@ type ListenerWrapper struct {
 	NodeSNI              string         `json:"node_sni,omitempty"`
 	NodeInsecure         bool           `json:"node_insecure,omitempty"`
 
-	// OutboundRaw selects the module used to reach AnyTLS targets. When empty
-	// the built-in "direct" outbound is used. With named outbounds configured,
-	// it acts as the default outbound for users without an explicit reference
-	// (unless default_outbound overrides it).
-	OutboundRaw json.RawMessage `json:"outbound,omitempty" caddy:"namespace=caddy.listeners.anytls.outbounds inline_key=dialer"`
-
 	// OutboundsRaw declares named outbounds that users can reference by name.
-	// The names "direct" and "default" are reserved: "direct" always resolves
-	// to the built-in direct outbound and never needs to be declared.
+	// The name "direct" is reserved: it always resolves to the built-in direct
+	// outbound and never needs to be declared.
 	OutboundsRaw map[string]json.RawMessage `json:"outbounds,omitempty" caddy:"namespace=caddy.listeners.anytls.outbounds inline_key=dialer"`
 
 	// DefaultOutbound selects the named outbound used for users without an
-	// explicit outbound reference. When empty, the single "outbound" module is
-	// used if configured, otherwise the built-in direct outbound.
+	// explicit outbound reference. When empty, the built-in direct outbound is
+	// used.
 	DefaultOutbound string `json:"default_outbound,omitempty"`
 
-	logger              *zap.Logger
-	outbound            Outbound
-	namedOutbounds      map[string]Outbound
-	defaultOutbound     Outbound
-	defaultOutboundName string
-	userOutbound        map[string]Outbound
-	userOutboundName    map[string]string
-	active              int64
-	activeStreams       int64
-	connSeq             uint64
-	fallbackSet         bool
-	registry            *sessionRegistry
-	detector            Detector
-	service             *singanytls.Service
-	allowCIDRPrefixes   []netip.Prefix
-	denyCIDRPrefixes    []netip.Prefix
-	dialFunc            func(ctx context.Context, network string, address string) (net.Conn, error)
-	listenPacketFunc    func(ctx context.Context, network string, address string) (net.PacketConn, error)
-	resolveFunc         func(ctx context.Context, network string, host string) ([]netip.Addr, error)
+	logger           *zap.Logger
+	namedOutbounds   map[string]Outbound
+	defaultSelection outboundSelection
+	userSelections   map[string]outboundSelection
+	active           int64
+	activeStreams    int64
+	connSeq          uint64
+	fallbackSet      bool
+	registry         *sessionRegistry
+	detector         passwordHashDetector
+	service          *singanytls.Service
+}
+
+type outboundSelection struct {
+	outbound Outbound
+	name     string
 }
 
 // User defines one AnyTLS account.
@@ -148,38 +129,16 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	if serverFromContext, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && serverFromContext != nil {
 		server = serverFromContext
 	}
-	if err := lw.compileCIDRPolicies(); err != nil {
+	if err := lw.provisionNamedOutbounds(ctx); err != nil {
 		return err
 	}
 
-	// A configured outbound is loaded only when the raw config is a real module
-	// object. An explicit JSON null (or an empty value) falls back to direct,
-	// matching the documented default.
-	hasSingleOutbound := len(lw.OutboundRaw) > 0 && string(lw.OutboundRaw) != "null"
-	if hasSingleOutbound {
-		mod, err := ctx.LoadModule(lw, "OutboundRaw")
-		if err != nil {
-			return fmt.Errorf("load outbound module: %w", err)
-		}
-		outbound, ok := mod.(Outbound)
-		if !ok {
-			return fmt.Errorf("configured outbound %T is not an anytls outbound", mod)
-		}
-		lw.outbound = outbound
-	}
-	if lw.outbound == nil {
-		lw.outbound = new(DirectOutbound)
-	}
-	if err := lw.provisionNamedOutbounds(ctx, hasSingleOutbound); err != nil {
-		return err
-	}
-
-	lw.detector = NewPasswordHashDetector(lw.Users)
+	lw.detector = newPasswordHashDetector(lw.Users)
 
 	service, err := singanytls.NewService(singanytls.ServiceConfig{
 		PaddingScheme: []byte(lw.PaddingScheme),
 		Users:         lw.anyTLSUsers(),
-		Handler:       &directTCPHandler{config: lw},
+		Handler:       &proxyHandler{config: lw},
 		Logger:        zapLogger{base: lw.logger},
 	})
 	if err != nil {
@@ -197,14 +156,14 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 // Validate) because ctx.LoadModule zeroes the raw fields and only the loaded
 // namedOutbounds map reflects the declared names. The resulting maps are
 // read-only after Provision, so concurrent reads at dial time need no locking.
-func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context, hasSingleOutbound bool) error {
+func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context) error {
 	// The reserved-name check must run before the built-in "direct" entry is
 	// injected, otherwise the injection would shadow a user declaration.
 	for name := range lw.OutboundsRaw {
 		if name == "" {
 			return errors.New("named outbound must not have an empty name")
 		}
-		if name == reservedOutboundDirect || name == reservedOutboundDefault {
+		if name == reservedOutboundDirect {
 			return fmt.Errorf("outbound name %q is reserved", name)
 		}
 	}
@@ -229,28 +188,17 @@ func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context, hasSingleO
 	}
 	lw.namedOutbounds[reservedOutboundDirect] = new(DirectOutbound)
 
-	// Default outbound resolution order (backward compatible):
-	// default_outbound name > single "outbound" module > built-in direct.
-	switch {
-	case lw.DefaultOutbound != "":
+	if lw.DefaultOutbound != "" {
 		outbound, ok := lw.namedOutbounds[lw.DefaultOutbound]
 		if !ok {
 			return fmt.Errorf("default_outbound %q references an undeclared outbound", lw.DefaultOutbound)
 		}
-		lw.defaultOutbound = outbound
-		lw.defaultOutboundName = lw.DefaultOutbound
-	case hasSingleOutbound:
-		lw.defaultOutbound = lw.outbound
-		lw.defaultOutboundName = reservedOutboundDefault
-	default:
-		lw.defaultOutbound = lw.outbound
-		lw.defaultOutboundName = reservedOutboundDirect
+		lw.defaultSelection = outboundSelection{outbound: outbound, name: lw.DefaultOutbound}
+	} else {
+		lw.defaultSelection = outboundSelection{outbound: lw.namedOutbounds[reservedOutboundDirect], name: reservedOutboundDirect}
 	}
 
-	// Both maps hold entries only for users with an explicit outbound
-	// reference and always share the same key set.
-	lw.userOutbound = make(map[string]Outbound)
-	lw.userOutboundName = make(map[string]string)
+	lw.userSelections = make(map[string]outboundSelection)
 	for _, user := range lw.Users {
 		if user.Outbound == "" {
 			continue
@@ -259,26 +207,27 @@ func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context, hasSingleO
 		if !ok {
 			return fmt.Errorf("user %q references an undeclared outbound %q", user.Name, user.Outbound)
 		}
-		lw.userOutbound[user.Name] = outbound
-		lw.userOutboundName[user.Name] = user.Outbound
+		lw.userSelections[user.Name] = outboundSelection{outbound: outbound, name: user.Outbound}
 	}
 
 	return nil
 }
 
-// resolveDefaultOutbound returns the outbound and log name used when the
-// authenticated user has no explicit outbound reference. Provision always
-// sets defaultOutbound; the trailing config.outbound and DirectOutbound
-// tiers keep wrappers built without Provision (hand-made test fixtures)
-// working.
-func (lw *ListenerWrapper) resolveDefaultOutbound() (Outbound, string) {
-	if lw.defaultOutbound != nil {
-		return lw.defaultOutbound, lw.defaultOutboundName
+// defaultOutboundSelection returns the outbound and log name used when the
+// authenticated user has no explicit outbound reference. Provision sets
+// defaultSelection; the direct fallback keeps hand-made test fixtures useful.
+func (lw *ListenerWrapper) defaultOutboundSelection() outboundSelection {
+	if lw.defaultSelection.outbound != nil {
+		return lw.defaultSelection
 	}
-	if lw.outbound != nil {
-		return lw.outbound, reservedOutboundDefault
+	return outboundSelection{outbound: new(DirectOutbound), name: reservedOutboundDirect}
+}
+
+func (lw *ListenerWrapper) outboundSelectionForUser(user string) outboundSelection {
+	if selection, ok := lw.userSelections[user]; ok {
+		return selection
 	}
-	return &DirectOutbound{}, reservedOutboundDirect
+	return lw.defaultOutboundSelection()
 }
 
 // Cleanup closes all active AnyTLS sessions when the config is unloaded.
@@ -317,16 +266,7 @@ func (lw *ListenerWrapper) Validate() error {
 	if lw.ConnectTimeout < 0 {
 		return fmt.Errorf("connect_timeout must be non-negative")
 	}
-	if err := lw.compileCIDRPolicies(); err != nil {
-		return err
-	}
-	for _, domain := range append(append([]string{}, lw.AllowDomains...), lw.DenyDomains...) {
-		if domain == "" {
-			return fmt.Errorf("domain policy entry must not be empty")
-		}
-	}
-
-	seen := make([]string, 0, len(lw.Users))
+	seen := make(map[string]struct{}, len(lw.Users))
 	passwords := make(map[[32]byte]string, len(lw.Users))
 	for _, user := range lw.Users {
 		if user.Name == "" {
@@ -335,7 +275,7 @@ func (lw *ListenerWrapper) Validate() error {
 		if user.Password == "" {
 			return fmt.Errorf("user %q password must not be empty", user.Name)
 		}
-		if slices.Contains(seen, user.Name) {
+		if _, ok := seen[user.Name]; ok {
 			return fmt.Errorf("duplicate user %q", user.Name)
 		}
 		passwordHash := sha256.Sum256([]byte(user.Password))
@@ -343,7 +283,7 @@ func (lw *ListenerWrapper) Validate() error {
 			return fmt.Errorf("users %q and %q must not share a password", existing, user.Name)
 		}
 		passwords[passwordHash] = user.Name
-		seen = append(seen, user.Name)
+		seen[user.Name] = struct{}{}
 	}
 
 	return nil
@@ -405,8 +345,6 @@ func (lw *ListenerWrapper) prepareWebsiteConn(conn *bufferedConn) (net.Conn, err
 
 var (
 	errInvalidDestination       = errors.New("invalid destination")
-	errPrivateDestinationDenied = errors.New("private destination denied")
-	errDestinationPolicyDenied  = errors.New("destination policy denied")
 	errInvalidUDPOverTCPRequest = errors.New("invalid udp over tcp request")
 	errUnsupportedUDPOverTCP    = errors.New("unsupported udp over tcp")
 	errStreamLimitExceeded      = errors.New("stream concurrency limit exceeded")
@@ -433,10 +371,6 @@ func dialFailureReason(err error) string {
 	switch {
 	case errors.Is(err, errInvalidDestination):
 		return "invalid_destination"
-	case errors.Is(err, errPrivateDestinationDenied):
-		return "private_target_denied"
-	case errors.Is(err, errDestinationPolicyDenied):
-		return "destination_policy_denied"
 	case errors.Is(err, errInvalidUDPOverTCPRequest):
 		return "invalid_udp_over_tcp_request"
 	case errors.Is(err, errUnsupportedUDPOverTCP):
