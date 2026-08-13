@@ -15,7 +15,6 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/varbin"
@@ -26,11 +25,9 @@ import (
 // recordingOutbound wraps another StreamOutbound and records the addresses it dials,
 // so tests can assert the handler routes egress through the configured module.
 type recordingOutbound struct {
-	inner      StreamOutbound
-	mu         sync.Mutex
-	dialed     []M.Socksaddr
-	openCount  int
-	packetConn PacketConn
+	inner  StreamOutbound
+	mu     sync.Mutex
+	dialed []M.Socksaddr
 }
 
 func (o *recordingOutbound) HandleSession(_ context.Context, session *OutboundSession) error {
@@ -45,13 +42,6 @@ func (o *recordingOutbound) DialContext(ctx context.Context, destination M.Socks
 }
 
 func (o *recordingOutbound) OpenPacket(ctx context.Context) (PacketConn, error) {
-	o.mu.Lock()
-	o.openCount++
-	packetConn := o.packetConn
-	o.mu.Unlock()
-	if packetConn != nil {
-		return packetConn, nil
-	}
 	return o.inner.OpenPacket(ctx)
 }
 
@@ -60,12 +50,6 @@ func (o *recordingOutbound) dials() []M.Socksaddr {
 	defer o.mu.Unlock()
 	return append([]M.Socksaddr(nil), o.dialed...)
 }
-
-type stubPacketConn struct{}
-
-func (*stubPacketConn) ReadPacket([]byte) (int, M.Socksaddr, error) { return 0, M.Socksaddr{}, io.EOF }
-func (*stubPacketConn) WritePacket([]byte, M.Socksaddr) error       { return nil }
-func (*stubPacketConn) Close() error                                { return nil }
 
 type blockingOutbound struct{}
 
@@ -120,38 +104,6 @@ func init() {
 	caddy.RegisterModule(&testNotOutbound{})
 }
 
-func TestDirectOutboundDialsTCP(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen() error = %v", err)
-	}
-	defer closeTest(listener)
-
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr != nil {
-			return
-		}
-		_, _ = conn.Write([]byte("ok"))
-		_ = conn.Close()
-	}()
-
-	var outbound DirectOutbound
-	conn, err := outbound.DialContext(t.Context(), M.ParseSocksaddr(listener.Addr().String()))
-	if err != nil {
-		t.Fatalf("DialContext() error = %v", err)
-	}
-	defer closeTest(conn)
-
-	buf := make([]byte, 2)
-	if _, err := conn.Read(buf); err != nil {
-		t.Fatalf("Read() error = %v", err)
-	}
-	if string(buf) != "ok" {
-		t.Fatalf("Read() = %q, want %q", buf, "ok")
-	}
-}
-
 func TestDirectOutboundOpenPacket(t *testing.T) {
 	var outbound DirectOutbound
 	packetConn, err := outbound.OpenPacket(t.Context())
@@ -192,6 +144,9 @@ func TestSOCKS5OutboundPreservesTCPDomain(t *testing.T) {
 			}
 			return clientSide, nil
 		}),
+	}
+	if err := outbound.Provision(caddy.Context{Context: t.Context()}); err != nil {
+		t.Fatalf("Provision() error = %v", err)
 	}
 
 	destination := M.ParseSocksaddr("service.example.test:443")
@@ -256,6 +211,9 @@ func TestSOCKS5OutboundPreservesUDPDomain(t *testing.T) {
 				return nil, errors.New("unexpected proxy network")
 			}
 		}),
+	}
+	if err := outbound.Provision(caddy.Context{Context: t.Context()}); err != nil {
+		t.Fatalf("Provision() error = %v", err)
 	}
 
 	packetConn, err := outbound.OpenPacket(t.Context())
@@ -325,6 +283,9 @@ func TestSOCKS5OutboundHandshakeHonorsContext(t *testing.T) {
 		dialer: contextDialerFunc(func(context.Context, string, string) (net.Conn, error) {
 			return clientSide, nil
 		}),
+	}
+	if err := outbound.Provision(caddy.Context{Context: t.Context()}); err != nil {
+		t.Fatalf("Provision() error = %v", err)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
@@ -421,16 +382,15 @@ func encodeSOCKS5UDPPacket(t *testing.T, source M.Socksaddr, payload []byte) []b
 }
 
 func TestUnmarshalCaddyfileRejectsUnnamedOutbound(t *testing.T) {
-	dispenser := caddyfile.NewTestDispenser(`
+	var wrapper ListenerWrapper
+	err := wrapper.UnmarshalCaddyfile(caddyfile.NewTestDispenser(`
 	anytls {
 		user alice secret
 		outbound direct
 	}
-	`)
-
-	var wrapper ListenerWrapper
-	if err := wrapper.UnmarshalCaddyfile(dispenser); err == nil {
-		t.Fatal("UnmarshalCaddyfile() error = nil, want named outbound requirement")
+	`))
+	if err == nil {
+		t.Fatal("UnmarshalCaddyfile() accepted outbound without both a name and module")
 	}
 }
 
@@ -507,98 +467,6 @@ func TestSOCKS5OutboundRejectsInvalidConfiguration(t *testing.T) {
 	}
 }
 
-func TestUnmarshalCaddyfileRejectsDuplicateOutbound(t *testing.T) {
-	dispenser := caddyfile.NewTestDispenser(`
-	anytls {
-		user alice secret
-		outbound proxy direct
-		outbound proxy direct
-	}
-	`)
-
-	var wrapper ListenerWrapper
-	if err := wrapper.UnmarshalCaddyfile(dispenser); err == nil {
-		t.Fatal("UnmarshalCaddyfile() error = nil, want duplicate outbound error")
-	}
-}
-
-func TestUnmarshalCaddyfileRejectsUnknownOutbound(t *testing.T) {
-	dispenser := caddyfile.NewTestDispenser(`
-	anytls {
-		user alice secret
-		outbound missing
-	}
-	`)
-
-	var wrapper ListenerWrapper
-	if err := wrapper.UnmarshalCaddyfile(dispenser); err == nil {
-		t.Fatal("UnmarshalCaddyfile() error = nil, want unknown module error")
-	}
-}
-
-func TestProvisionDefaultsToDirectOutbound(t *testing.T) {
-	wrapper := &ListenerWrapper{
-		Users:    []User{{Name: "alice", Password: "secret", Enabled: true}},
-		logger:   zap.NewNop(),
-		registry: newSessionRegistry(),
-	}
-	if err := wrapper.Provision(caddy.Context{Context: t.Context()}); err != nil {
-		t.Fatalf("Provision() error = %v", err)
-	}
-	if _, ok := wrapper.defaultSelection.outbound.(*DirectOutbound); !ok || wrapper.defaultSelection.name != "direct" {
-		t.Fatalf("default outbound = (%T, %q), want (*DirectOutbound, direct)", wrapper.defaultSelection.outbound, wrapper.defaultSelection.name)
-	}
-}
-
-func TestUnmarshalJSONRejectsLegacyUnnamedOutbound(t *testing.T) {
-	var wrapper ListenerWrapper
-	if err := json.Unmarshal([]byte(`{"users":[{"name":"alice","password":"secret"}],"outbound":{"dialer":"direct"}}`), &wrapper); err == nil {
-		t.Fatal("json.Unmarshal() error = nil, want legacy outbound field rejection")
-	}
-}
-
-func TestProvisionLoadsConfiguredDefaultOutbound(t *testing.T) {
-	dispenser := caddyfile.NewTestDispenser(`
-	anytls {
-		user alice secret
-		outbound proxy test-recorder
-		default_outbound proxy
-	}
-	`)
-
-	wrapper := &ListenerWrapper{
-		logger:   zap.NewNop(),
-		registry: newSessionRegistry(),
-	}
-	if err := wrapper.UnmarshalCaddyfile(dispenser); err != nil {
-		t.Fatalf("UnmarshalCaddyfile() error = %v", err)
-	}
-
-	ctx, cancel := caddy.NewContext(caddy.Context{Context: t.Context()})
-	defer cancel()
-	if err := wrapper.Provision(ctx); err != nil {
-		t.Fatalf("Provision() error = %v", err)
-	}
-	if _, ok := wrapper.defaultSelection.outbound.(*testRecorderOutbound); !ok || wrapper.defaultSelection.name != "proxy" {
-		t.Fatalf("default outbound = (%T, %q), want (*testRecorderOutbound, proxy)", wrapper.defaultSelection.outbound, wrapper.defaultSelection.name)
-	}
-}
-
-func TestProvisionRejectsNonOutboundModule(t *testing.T) {
-	wrapper := &ListenerWrapper{
-		Users:        []User{{Name: "alice", Password: "secret", Enabled: true}},
-		OutboundsRaw: map[string]json.RawMessage{"bad": json.RawMessage(`{"dialer":"test-not-outbound"}`)},
-		logger:       zap.NewNop(),
-		registry:     newSessionRegistry(),
-	}
-	ctx, cancel := caddy.NewContext(caddy.Context{Context: t.Context()})
-	defer cancel()
-	err := wrapper.Provision(ctx)
-	if err == nil || !strings.Contains(err.Error(), "is not an anytls outbound") {
-		t.Fatalf("Provision() error = %v, want rejection of a module that does not implement Outbound", err)
-	}
-}
-
 func TestDirectOutboundUnmarshalCaddyfileRejectsConfig(t *testing.T) {
 	if err := new(DirectOutbound).UnmarshalCaddyfile(caddyfile.NewTestDispenser("direct extra")); err == nil {
 		t.Fatal("UnmarshalCaddyfile() accepted an extra argument, want error")
@@ -608,58 +476,11 @@ func TestDirectOutboundUnmarshalCaddyfileRejectsConfig(t *testing.T) {
 	}
 }
 
-func TestHandlerDialsThroughConfiguredOutbound(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen() error = %v", err)
-	}
-	defer closeTest(listener)
-	go acceptLoop(t.Context(), listener)
-
-	recorder := &recordingOutbound{inner: new(DirectOutbound)}
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
-	wrapper.defaultSelection = outboundSelection{outbound: recorder, name: "proxy"}
-
-	handler := &proxyHandler{config: wrapper}
-	conn, err := handler.dialContext(t.Context(), M.ParseSocksaddr(listener.Addr().String()))
-	if err != nil {
-		t.Fatalf("dialContext() error = %v", err)
-	}
-	closeTest(conn)
-
-	dials := recorder.dials()
-	if len(dials) != 1 || dials[0].String() != listener.Addr().String() {
-		t.Fatalf("recorded dials = %v, want [%s]", dials, listener.Addr().String())
-	}
-}
-
-func TestHandlerOpensPacketsThroughConfiguredOutbound(t *testing.T) {
-	packetConn := new(stubPacketConn)
-	recorder := &recordingOutbound{packetConn: packetConn}
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
-	wrapper.defaultSelection = outboundSelection{outbound: recorder, name: "proxy"}
-
-	got, err := (&proxyHandler{config: wrapper}).openPacketContext(t.Context())
-	if err != nil {
-		t.Fatalf("openPacketContext() error = %v", err)
-	}
-	if got != packetConn {
-		t.Fatalf("openPacketContext() = %T, want configured packet connection", got)
-	}
-	recorder.mu.Lock()
-	openCount := recorder.openCount
-	recorder.mu.Unlock()
-	if openCount != 1 {
-		t.Fatalf("OpenPacket() call count = %d, want 1", openCount)
-	}
-}
-
 func TestHandlerOutboundDialHonorsConnectTimeout(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 	wrapper.ConnectTimeout = caddy.Duration(20 * time.Millisecond)
-	wrapper.defaultSelection = outboundSelection{outbound: new(blockingOutbound), name: "proxy"}
 
-	_, err := (&proxyHandler{config: wrapper}).dialContext(t.Context(), M.ParseSocksaddr("192.0.2.1:443"))
+	_, err := (&proxyHandler{config: wrapper}).dialContext(t.Context(), new(blockingOutbound), M.ParseSocksaddr("192.0.2.1:443"))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("dialContext() error = %v, want context deadline exceeded", err)
 	}
@@ -668,9 +489,8 @@ func TestHandlerOutboundDialHonorsConnectTimeout(t *testing.T) {
 func TestHandlerOutboundOpenPacketHonorsConnectTimeout(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 	wrapper.ConnectTimeout = caddy.Duration(20 * time.Millisecond)
-	wrapper.defaultSelection = outboundSelection{outbound: new(blockingOutbound), name: "proxy"}
 
-	_, err := (&proxyHandler{config: wrapper}).openPacketContext(t.Context())
+	_, err := (&proxyHandler{config: wrapper}).openPacketContext(t.Context(), new(blockingOutbound))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("openPacketContext() error = %v, want context deadline exceeded", err)
 	}
@@ -679,34 +499,12 @@ func TestHandlerOutboundOpenPacketHonorsConnectTimeout(t *testing.T) {
 func TestHandlerOutboundDialPropagatesCancellation(t *testing.T) {
 	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
 	wrapper.ConnectTimeout = caddy.Duration(time.Second)
-	wrapper.defaultSelection = outboundSelection{outbound: new(blockingOutbound), name: "proxy"}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	_, err := (&proxyHandler{config: wrapper}).dialContext(ctx, M.ParseSocksaddr("192.0.2.1:443"))
+	_, err := (&proxyHandler{config: wrapper}).dialContext(ctx, new(blockingOutbound), M.ParseSocksaddr("192.0.2.1:443"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("dialContext() error = %v, want context canceled", err)
-	}
-}
-
-func TestHandlerPassesClientTargetToSelectedOutbound(t *testing.T) {
-	for _, address := range []string{"service.test:443", "127.0.0.1:8080"} {
-		t.Run(address, func(t *testing.T) {
-			recorder := &recordingOutbound{inner: new(blockingOutbound)}
-			wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
-			wrapper.userSelections = map[string]outboundSelection{
-				"alice": {outbound: recorder, name: "proxy"},
-			}
-
-			ctx, cancel := context.WithCancel(auth.ContextWithUser(t.Context(), "alice"))
-			cancel()
-			_, _ = (&proxyHandler{config: wrapper}).dialContext(ctx, M.ParseSocksaddr(address))
-
-			dials := recorder.dials()
-			if len(dials) != 1 || dials[0].String() != address {
-				t.Fatalf("recorded dials = %v, want [%s]", dials, address)
-			}
-		})
 	}
 }
 
@@ -815,28 +613,6 @@ func TestUnmarshalCaddyfileUserArgCount(t *testing.T) {
 	}
 }
 
-func TestUnmarshalJSONNamedOutboundFields(t *testing.T) {
-	input := `{
-		"users": [{"name": "alice", "password": "secret", "outbound": "proxy"}],
-		"outbounds": {"proxy": {"dialer": "direct"}},
-		"default_outbound": "proxy"
-	}`
-
-	var wrapper ListenerWrapper
-	if err := json.Unmarshal([]byte(input), &wrapper); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v", err)
-	}
-	if _, ok := wrapper.OutboundsRaw["proxy"]; !ok {
-		t.Fatalf("OutboundsRaw = %v, want key proxy", wrapper.OutboundsRaw)
-	}
-	if wrapper.DefaultOutbound != "proxy" {
-		t.Fatalf("DefaultOutbound = %q, want %q", wrapper.DefaultOutbound, "proxy")
-	}
-	if len(wrapper.Users) != 1 || wrapper.Users[0].Outbound != "proxy" {
-		t.Fatalf("Users = %#v, want alice referencing proxy", wrapper.Users)
-	}
-}
-
 func newProvisionedWrapper(t *testing.T, configJSON string) (*ListenerWrapper, error) {
 	t.Helper()
 
@@ -851,7 +627,7 @@ func newProvisionedWrapper(t *testing.T, configJSON string) (*ListenerWrapper, e
 	return &wrapper, wrapper.Provision(ctx)
 }
 
-func TestProvisionNamedOutboundsAndUserMaps(t *testing.T) {
+func TestProvisionResolvesOutboundSelections(t *testing.T) {
 	wrapper, err := newProvisionedWrapper(t, `{
 		"users": [
 			{"name": "alice", "password": "a-pw", "outbound": "rec"},
@@ -868,91 +644,47 @@ func TestProvisionNamedOutboundsAndUserMaps(t *testing.T) {
 		t.Fatalf("Provision() error = %v", err)
 	}
 
-	if len(wrapper.namedOutbounds) != 3 {
-		t.Fatalf("len(namedOutbounds) = %d, want 3 (rec, other, injected direct)", len(wrapper.namedOutbounds))
-	}
-	if _, ok := wrapper.namedOutbounds["rec"].(*testRecorderOutbound); !ok {
-		t.Fatalf("namedOutbounds[rec] = %T, want *testRecorderOutbound", wrapper.namedOutbounds["rec"])
-	}
-	if _, ok := wrapper.namedOutbounds["direct"].(*DirectOutbound); !ok {
-		t.Fatalf("namedOutbounds[direct] = %T, want injected *DirectOutbound", wrapper.namedOutbounds["direct"])
-	}
-	if wrapper.defaultSelection.outbound != wrapper.namedOutbounds["other"] || wrapper.defaultSelection.name != "other" {
-		t.Fatalf("default outbound = (%T, %q), want (namedOutbounds[other], other)", wrapper.defaultSelection.outbound, wrapper.defaultSelection.name)
+	if _, ok := wrapper.defaultSelection.outbound.(*DirectOutbound); !ok || wrapper.defaultSelection.name != "other" {
+		t.Fatalf("default outbound = (%T, %q), want (*DirectOutbound, other)", wrapper.defaultSelection.outbound, wrapper.defaultSelection.name)
 	}
 	if len(wrapper.userSelections) != 2 {
 		t.Fatalf("len(userSelections) = %d, want 2: only explicit references get entries", len(wrapper.userSelections))
 	}
-	if selection := wrapper.userSelections["alice"]; selection.outbound != wrapper.namedOutbounds["rec"] || selection.name != "rec" {
-		t.Fatalf("alice outbound = (%T, %q), want (namedOutbounds[rec], rec)", selection.outbound, selection.name)
+	if selection := wrapper.userSelections["alice"]; selection.name != "rec" {
+		t.Fatalf("alice outbound = (%T, %q), want test recorder named rec", selection.outbound, selection.name)
+	} else if _, ok := selection.outbound.(*testRecorderOutbound); !ok {
+		t.Fatalf("alice outbound = %T, want *testRecorderOutbound", selection.outbound)
 	}
-	if selection := wrapper.userSelections["bob"]; selection.outbound != wrapper.namedOutbounds["direct"] || selection.name != "direct" {
+	if selection := wrapper.userSelections["bob"]; selection.name != "direct" {
 		t.Fatalf("bob outbound = (%T, %q), want the built-in direct without a declaration", selection.outbound, selection.name)
+	} else if _, ok := selection.outbound.(*DirectOutbound); !ok {
+		t.Fatalf("bob outbound = %T, want *DirectOutbound", selection.outbound)
 	}
 	if _, ok := wrapper.userSelections["carol"]; ok {
 		t.Fatal("userSelections has entry for carol, want none for users without explicit outbound")
 	}
 }
 
-func TestProvisionDefaultOutboundResolution(t *testing.T) {
-	t.Run("configured named default", func(t *testing.T) {
-		wrapper, err := newProvisionedWrapper(t, `{
-			"users": [{"name": "alice", "password": "secret"}],
-			"outbounds": {"named": {"dialer": "test-recorder"}},
-			"default_outbound": "named"
-		}`)
-		if err != nil {
-			t.Fatalf("Provision() error = %v", err)
-		}
-		if wrapper.defaultSelection.outbound != wrapper.namedOutbounds["named"] || wrapper.defaultSelection.name != "named" {
-			t.Fatalf("default outbound = (%T, %q), want (namedOutbounds[named], named)", wrapper.defaultSelection.outbound, wrapper.defaultSelection.name)
-		}
-	})
-
-	t.Run("no outbound falls back to direct", func(t *testing.T) {
-		wrapper, err := newProvisionedWrapper(t, `{
-			"users": [{"name": "alice", "password": "secret"}]
-		}`)
-		if err != nil {
-			t.Fatalf("Provision() error = %v", err)
-		}
-		if _, ok := wrapper.defaultSelection.outbound.(*DirectOutbound); !ok || wrapper.defaultSelection.name != "direct" {
-			t.Fatalf("default outbound = (%T, %q), want (*DirectOutbound, direct)", wrapper.defaultSelection.outbound, wrapper.defaultSelection.name)
-		}
-	})
+func TestProvisionDefaultsToDirectOutbound(t *testing.T) {
+	wrapper, err := newProvisionedWrapper(t, `{
+		"users": [{"name": "alice", "password": "secret"}]
+	}`)
+	if err != nil {
+		t.Fatalf("Provision() error = %v", err)
+	}
+	if _, ok := wrapper.defaultSelection.outbound.(*DirectOutbound); !ok || wrapper.defaultSelection.name != "direct" {
+		t.Fatalf("default outbound = (%T, %q), want (*DirectOutbound, direct)", wrapper.defaultSelection.outbound, wrapper.defaultSelection.name)
+	}
 }
 
 func TestProvisionRejectsReservedOutboundNames(t *testing.T) {
-	for _, reserved := range []string{"direct"} {
-		t.Run("json declares "+reserved, func(t *testing.T) {
-			_, err := newProvisionedWrapper(t, `{
-				"users": [{"name": "alice", "password": "secret"}],
-				"outbounds": {"`+reserved+`": {"dialer": "direct"}}
-			}`)
-			if err == nil || !strings.Contains(err.Error(), "reserved") {
-				t.Fatalf("Provision() error = %v, want reserved name error", err)
-			}
-		})
+	_, err := newProvisionedWrapper(t, `{
+		"users": [{"name": "alice", "password": "secret"}],
+		"outbounds": {"direct": {"dialer": "direct"}}
+	}`)
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("Provision() error = %v, want reserved name error", err)
 	}
-
-	t.Run("caddyfile declares direct", func(t *testing.T) {
-		dispenser := caddyfile.NewTestDispenser(`
-		anytls {
-			user alice secret
-			outbound direct direct
-		}
-		`)
-		wrapper := &ListenerWrapper{logger: zap.NewNop(), registry: newSessionRegistry()}
-		if err := wrapper.UnmarshalCaddyfile(dispenser); err != nil {
-			t.Fatalf("UnmarshalCaddyfile() error = %v", err)
-		}
-		ctx, cancel := caddy.NewContext(caddy.Context{Context: t.Context()})
-		defer cancel()
-		err := wrapper.Provision(ctx)
-		if err == nil || !strings.Contains(err.Error(), "reserved") {
-			t.Fatalf("Provision() error = %v, want reserved name error", err)
-		}
-	})
 }
 
 func TestProvisionRejectsUndeclaredOutboundReferences(t *testing.T) {
@@ -974,39 +706,6 @@ func TestProvisionRejectsUndeclaredOutboundReferences(t *testing.T) {
 			t.Fatalf("Provision() error = %v, want undeclared outbound error", err)
 		}
 	})
-
-	t.Run("caddyfile user reference", func(t *testing.T) {
-		dispenser := caddyfile.NewTestDispenser(`
-		anytls {
-			user alice secret missing
-		}
-		`)
-		wrapper := &ListenerWrapper{logger: zap.NewNop(), registry: newSessionRegistry()}
-		if err := wrapper.UnmarshalCaddyfile(dispenser); err != nil {
-			t.Fatalf("UnmarshalCaddyfile() error = %v", err)
-		}
-		ctx, cancel := caddy.NewContext(caddy.Context{Context: t.Context()})
-		defer cancel()
-		err := wrapper.Provision(ctx)
-		if err == nil || !strings.Contains(err.Error(), "undeclared") {
-			t.Fatalf("Provision() error = %v, want undeclared outbound error", err)
-		}
-	})
-}
-
-func TestProvisionAllowsDirectReferenceWithoutDeclaration(t *testing.T) {
-	wrapper, err := newProvisionedWrapper(t, `{
-		"users": [{"name": "alice", "password": "secret", "outbound": "direct"}]
-	}`)
-	if err != nil {
-		t.Fatalf("Provision() error = %v", err)
-	}
-	if _, ok := wrapper.userSelections["alice"].outbound.(*DirectOutbound); !ok {
-		t.Fatalf("userSelections[alice].outbound = %T, want *DirectOutbound", wrapper.userSelections["alice"].outbound)
-	}
-	if wrapper.userSelections["alice"].name != "direct" {
-		t.Fatalf("userSelections[alice].name = %q, want %q", wrapper.userSelections["alice"].name, "direct")
-	}
 }
 
 func TestProvisionRejectsEmptyNamedOutboundName(t *testing.T) {
@@ -1031,132 +730,5 @@ func TestProvisionRejectsNonOutboundNamedModule(t *testing.T) {
 	}`)
 	if err == nil || !strings.Contains(err.Error(), "is not an anytls outbound") {
 		t.Fatalf("Provision() error = %v, want rejection of a module that does not implement Outbound", err)
-	}
-}
-
-func TestOutboundForUserSelection(t *testing.T) {
-	recorder := &recordingOutbound{inner: new(DirectOutbound)}
-	named := &recordingOutbound{inner: new(DirectOutbound)}
-
-	// Nothing configured at all uses the built-in direct outbound.
-	bare := &proxyHandler{config: &ListenerWrapper{}}
-	selection := bare.outboundForUser(t.Context())
-	if _, ok := selection.outbound.(*DirectOutbound); !ok || selection.name != "direct" {
-		t.Fatalf("bare wrapper outbound = (%T, %q), want (*DirectOutbound, direct)", selection.outbound, selection.name)
-	}
-
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
-	handler := &proxyHandler{config: wrapper}
-	// A configured default applies when the user has no explicit selection.
-	wrapper.defaultSelection = outboundSelection{outbound: named, name: "exit-home"}
-	selection = handler.outboundForUser(t.Context())
-	if selection.outbound != Outbound(named) || selection.name != "exit-home" {
-		t.Fatalf("default tier = (%T, %q), want (named default, exit-home)", selection.outbound, selection.name)
-	}
-
-	// An explicit per-user reference wins over the configured default.
-	wrapper.userSelections = map[string]outboundSelection{
-		"alice": {outbound: recorder, name: "exit-a"},
-	}
-	selection = handler.outboundForUser(auth.ContextWithUser(t.Context(), "alice"))
-	if selection.outbound != Outbound(recorder) || selection.name != "exit-a" {
-		t.Fatalf("user tier = (%T, %q), want (user outbound, exit-a)", selection.outbound, selection.name)
-	}
-	// Unknown users still get the default.
-	selection = handler.outboundForUser(auth.ContextWithUser(t.Context(), "mallory"))
-	if selection.outbound != Outbound(named) || selection.name != "exit-home" {
-		t.Fatalf("unknown user = (%T, %q), want the default outbound", selection.outbound, selection.name)
-	}
-}
-
-// Each connection must use the outbound selected for its authenticated user.
-func TestDialContextSelectsPerUserOutbound(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen() error = %v", err)
-	}
-	defer closeTest(listener)
-	go acceptLoop(t.Context(), listener)
-	address := listener.Addr().String()
-
-	recA := &recordingOutbound{inner: new(DirectOutbound)}
-	recB := &recordingOutbound{inner: new(DirectOutbound)}
-	recDefault := &recordingOutbound{inner: new(DirectOutbound)}
-	users := []User{
-		{Name: "alice", Password: "a-pw", Enabled: true, Outbound: "exit-a"},
-		{Name: "bob", Password: "b-pw", Enabled: true, Outbound: "exit-b"},
-		{Name: "carol", Password: "c-pw", Enabled: true},
-	}
-	wrapper := newTestWrapper(t, users)
-	wrapper.defaultSelection = outboundSelection{outbound: recDefault, name: "default-exit"}
-	wrapper.userSelections = map[string]outboundSelection{
-		"alice": {outbound: recA, name: "exit-a"},
-		"bob":   {outbound: recB, name: "exit-b"},
-	}
-	handler := &proxyHandler{config: wrapper}
-
-	for _, tt := range []struct {
-		user     string
-		recorder *recordingOutbound
-	}{
-		{user: "alice", recorder: recA},
-		{user: "bob", recorder: recB},
-		{user: "carol", recorder: recDefault},
-	} {
-		conn, err := handler.dialContext(auth.ContextWithUser(t.Context(), tt.user), M.ParseSocksaddr(address))
-		if err != nil {
-			t.Fatalf("dialContext(%s) error = %v", tt.user, err)
-		}
-		closeTest(conn)
-		dials := tt.recorder.dials()
-		if len(dials) != 1 || dials[0].String() != address {
-			t.Fatalf("user %s recorded dials = %v, want exactly [%s]", tt.user, dials, address)
-		}
-	}
-
-	if extra := recA.dials(); len(extra) != 1 {
-		t.Fatalf("recA dials = %v, want no cross-user dials", extra)
-	}
-	if extra := recB.dials(); len(extra) != 1 {
-		t.Fatalf("recB dials = %v, want no cross-user dials", extra)
-	}
-}
-
-func TestOpenPacketContextSelectsPerUserOutbound(t *testing.T) {
-	packetA := new(stubPacketConn)
-	packetB := new(stubPacketConn)
-	packetDefault := new(stubPacketConn)
-	recA := &recordingOutbound{packetConn: packetA}
-	recB := &recordingOutbound{packetConn: packetB}
-	recDefault := &recordingOutbound{packetConn: packetDefault}
-
-	users := []User{
-		{Name: "alice", Password: "a-pw", Enabled: true, Outbound: "exit-a"},
-		{Name: "bob", Password: "b-pw", Enabled: true, Outbound: "exit-b"},
-	}
-	wrapper := newTestWrapper(t, users)
-	wrapper.defaultSelection = outboundSelection{outbound: recDefault, name: "default-exit"}
-	wrapper.userSelections = map[string]outboundSelection{
-		"alice": {outbound: recA, name: "exit-a"},
-		"bob":   {outbound: recB, name: "exit-b"},
-	}
-	handler := &proxyHandler{config: wrapper}
-
-	for _, tt := range []struct {
-		name string
-		ctx  context.Context
-		want PacketConn
-	}{
-		{name: "alice", ctx: auth.ContextWithUser(t.Context(), "alice"), want: packetA},
-		{name: "bob", ctx: auth.ContextWithUser(t.Context(), "bob"), want: packetB},
-		{name: "no user", ctx: t.Context(), want: packetDefault},
-	} {
-		got, err := handler.openPacketContext(tt.ctx)
-		if err != nil {
-			t.Fatalf("openPacketContext(%s) error = %v", tt.name, err)
-		}
-		if got != tt.want {
-			t.Fatalf("openPacketContext(%s) = %p, want the per-user packet connection", tt.name, got)
-		}
 	}
 }

@@ -28,24 +28,15 @@ func newSessionRegistry() *sessionRegistry {
 	}
 }
 
-func (lw *ListenerWrapper) registerSession(connectionID uint64, conn net.Conn, cancel context.CancelFunc) {
+func (lw *ListenerWrapper) registerSession(connectionID uint64, conn net.Conn, cancel context.CancelFunc, user string) {
 	lw.registry.mu.Lock()
 	defer lw.registry.mu.Unlock()
 	lw.registry.sessions[connectionID] = &activeSession{
 		cancel:    cancel,
 		conn:      conn,
 		startedAt: time.Now(),
+		user:      user,
 	}
-}
-
-func (lw *ListenerWrapper) updateSessionUser(connectionID uint64, user string) {
-	lw.registry.mu.Lock()
-	defer lw.registry.mu.Unlock()
-	session, ok := lw.registry.sessions[connectionID]
-	if !ok {
-		return
-	}
-	session.user = user
 }
 
 func (lw *ListenerWrapper) unregisterSession(connectionID uint64) {
@@ -76,42 +67,33 @@ func (lw *ListenerWrapper) releaseSessionStream(connectionID uint64) {
 	}
 }
 
-func (lw *ListenerWrapper) closeActiveSessions(reason string) {
+func (lw *ListenerWrapper) closeActiveSessions() {
 	lw.registry.mu.Lock()
 	snapshots := make([]struct {
 		connectionID uint64
-		cancel       context.CancelFunc
-		conn         net.Conn
-		startedAt    time.Time
-		user         string
+		session      *activeSession
 	}, 0, len(lw.registry.sessions))
 	for connectionID, session := range lw.registry.sessions {
 		snapshots = append(snapshots, struct {
 			connectionID uint64
-			cancel       context.CancelFunc
-			conn         net.Conn
-			startedAt    time.Time
-			user         string
+			session      *activeSession
 		}{
 			connectionID: connectionID,
-			cancel:       session.cancel,
-			conn:         session.conn,
-			startedAt:    session.startedAt,
-			user:         session.user,
+			session:      session,
 		})
 	}
 	lw.registry.mu.Unlock()
 
 	for _, item := range snapshots {
-		item.cancel()
-		_ = item.conn.Close()
+		item.session.cancel()
+		_ = item.session.conn.Close()
 		lw.logger.Info("anytls session terminated",
 			zap.Uint64("connection_id", item.connectionID),
 			zap.String("event", "anytls_session"),
 			zap.String("outcome", "terminated"),
-			zap.String("reason", reason),
-			zap.String("user", item.user),
-			zap.Duration("duration", time.Since(item.startedAt)),
+			zap.String("reason", "config_unload"),
+			zap.String("user", item.session.user),
+			zap.Duration("duration", time.Since(item.session.startedAt)),
 		)
 	}
 }

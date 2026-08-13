@@ -91,8 +91,7 @@ func (o *AnyTLSOutbound) HandleSession(ctx context.Context, session *OutboundSes
 		return fmt.Errorf("handshake with anytls upstream %s: %w", o.Address, err)
 	}
 
-	var localPasswordHash [32]byte
-	if _, err := io.ReadFull(session.Connection(), localPasswordHash[:]); err != nil {
+	if _, err := io.CopyN(io.Discard, session.Connection(), sha256.Size); err != nil {
 		_ = upstream.Close()
 		return fmt.Errorf("read local anytls authentication hash: %w", err)
 	}
@@ -102,7 +101,7 @@ func (o *AnyTLSOutbound) HandleSession(ctx context.Context, session *OutboundSes
 		return fmt.Errorf("write upstream anytls authentication hash: %w", err)
 	}
 
-	return relaySession(ctx, session.Connection(), upstream)
+	return relayConnections(ctx, session.Connection(), upstream, nil)
 }
 
 func writeFull(writer io.Writer, payload []byte) error {
@@ -117,37 +116,6 @@ func writeFull(writer io.Writer, payload []byte) error {
 		payload = payload[n:]
 	}
 	return nil
-}
-
-func relaySession(ctx context.Context, inbound net.Conn, outbound net.Conn) error {
-	result := make(chan error, 2)
-	copyConn := func(dst net.Conn, src net.Conn) {
-		_, err := io.Copy(dst, src)
-		result <- err
-	}
-	go copyConn(outbound, inbound)
-	go copyConn(inbound, outbound)
-
-	var firstErr error
-	select {
-	case firstErr = <-result:
-	case <-ctx.Done():
-		firstErr = ctx.Err()
-	}
-	_ = inbound.Close()
-	_ = outbound.Close()
-
-	select {
-	case secondErr := <-result:
-		if firstErr == nil {
-			firstErr = secondErr
-		}
-	case <-ctx.Done():
-	}
-	if errors.Is(firstErr, io.EOF) || errors.Is(firstErr, net.ErrClosed) {
-		return nil
-	}
-	return firstErr
 }
 
 // UnmarshalCaddyfile parses an upstream AnyTLS server and TLS options.

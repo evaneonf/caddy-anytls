@@ -1,8 +1,10 @@
 package anytls
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -208,7 +210,7 @@ func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 		MaxPendingProbes     int                        `json:"max_pending_probes,omitempty"`
 		MaxStreamsPerSession int                        `json:"max_streams_per_session,omitempty"`
 		MaxConcurrentStreams int                        `json:"max_concurrent_streams,omitempty"`
-		Fallback             bool                       `json:"fallback,omitempty"`
+		Fallback             json.RawMessage            `json:"fallback"`
 		PaddingScheme        string                     `json:"padding_scheme,omitempty"`
 		LogNodeInfo          bool                       `json:"log_node_info,omitempty"`
 		NodeHosts            []string                   `json:"node_hosts,omitempty"`
@@ -217,8 +219,13 @@ func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 		NodeInsecure         bool                       `json:"node_insecure,omitempty"`
 		OutboundsRaw         map[string]json.RawMessage `json:"outbounds,omitempty"`
 		DefaultOutbound      string                     `json:"default_outbound,omitempty"`
+		UnnamedOutbound      json.RawMessage            `json:"outbound"`
 	}
-	if err := json.Unmarshal(data, &config); err != nil {
+	if err := caddy.StrictUnmarshalJSON(data, &config); err != nil {
+		return err
+	}
+	fallback, fallbackSet, err := unmarshalDefaultTrueBool(config.Fallback, "fallback")
+	if err != nil {
 		return err
 	}
 	lw.Users = config.Users
@@ -229,7 +236,8 @@ func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 	lw.MaxPendingProbes = config.MaxPendingProbes
 	lw.MaxStreamsPerSession = config.MaxStreamsPerSession
 	lw.MaxConcurrentStreams = config.MaxConcurrentStreams
-	lw.Fallback = config.Fallback
+	lw.Fallback = fallback
+	lw.fallbackSet = fallbackSet
 	lw.PaddingScheme = config.PaddingScheme
 	lw.LogNodeInfo = config.LogNodeInfo
 	lw.NodeHosts = config.NodeHosts
@@ -238,19 +246,10 @@ func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 	lw.NodeInsecure = config.NodeInsecure
 	lw.OutboundsRaw = config.OutboundsRaw
 	lw.DefaultOutbound = config.DefaultOutbound
-
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	if _, ok := raw["outbound"]; ok {
+	if config.UnnamedOutbound != nil {
 		return errors.New("JSON field \"outbound\" is not supported; declare a named entry in \"outbounds\" and select it with \"default_outbound\"")
 	}
-	if _, ok := raw["fallback"]; ok {
-		lw.fallbackSet = true
-	} else {
-		lw.Fallback = true
-	}
+
 	return nil
 }
 
@@ -258,20 +257,33 @@ func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
 // "enabled": false to disable an account.
 func (u *User) UnmarshalJSON(data []byte) error {
 	type userAlias User
-	var alias userAlias
-	if err := json.Unmarshal(data, &alias); err != nil {
+	var raw struct {
+		userAlias
+		Enabled json.RawMessage `json:"enabled"`
+	}
+	if err := caddy.StrictUnmarshalJSON(data, &raw); err != nil {
 		return err
 	}
-	*u = User(alias)
-
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
+	enabled, _, err := unmarshalDefaultTrueBool(raw.Enabled, "enabled")
+	if err != nil {
 		return err
 	}
-	if _, ok := raw["enabled"]; !ok {
-		u.Enabled = true
-	}
+	*u = User(raw.userAlias)
+	u.Enabled = enabled
 	return nil
+}
+
+func unmarshalDefaultTrueBool(raw json.RawMessage, field string) (value bool, set bool, err error) {
+	if raw == nil {
+		return true, false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return false, false, fmt.Errorf("JSON field %q must not be null", field)
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false, false, fmt.Errorf("JSON field %q must be a boolean: %w", field, err)
+	}
+	return value, true, nil
 }
 
 func parseDurationDirective(d *caddyfile.Dispenser, name string) (time.Duration, error) {

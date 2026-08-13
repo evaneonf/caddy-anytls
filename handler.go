@@ -2,6 +2,7 @@ package anytls
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -27,11 +28,19 @@ type handshakeSuccessReporter interface {
 func (h *proxyHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	startedAt := time.Now()
 	connectionID := connectionIDFromContext(ctx)
-	// Resolve the outbound name once so all logs for this connection agree.
-	outboundName := h.outboundNameForUser(ctx)
-	h.config.updateSessionUser(connectionID, userFromContext(ctx))
+	selection, ok := streamOutboundFromContext(ctx)
+	if !ok {
+		err := errors.New("stream outbound missing from AnyTLS session context")
+		reportHandshakeFailure(conn, err)
+		if onClose != nil {
+			onClose(err)
+		}
+		_ = conn.Close()
+		return
+	}
+	outboundName := selection.name
 	if !h.config.acquireStream(connectionID) {
-		err := fmt.Errorf("%w", errStreamLimitExceeded)
+		err := errStreamLimitExceeded
 		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), outboundName, err)
 		reportHandshakeFailure(conn, err)
 		if onClose != nil {
@@ -71,11 +80,11 @@ func (h *proxyHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sourc
 	})
 
 	if isUDPOverTCPDestination(destination) {
-		h.handleUDPOverTCP(ctx, conn, source, destination, startedAt, connectionID, outboundName, closeOnce)
+		h.handleUDPOverTCP(ctx, conn, source, destination, startedAt, connectionID, selection, closeOnce)
 		return
 	}
 
-	outbound, err := h.dialContext(ctx, destination)
+	outbound, err := h.dialContext(ctx, selection.outbound, destination)
 	if err != nil {
 		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), outboundName, err)
 		reportHandshakeFailure(conn, err)
@@ -110,7 +119,8 @@ func (h *proxyHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sourc
 	relay(ctx, inbound, outboundRelay, closeOnce)
 }
 
-func (h *proxyHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, connectionID uint64, outboundName string, closeOnce N.CloseHandlerFunc) {
+func (h *proxyHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, startedAt time.Time, connectionID uint64, selection selectedStreamOutbound, closeOnce N.CloseHandlerFunc) {
+	outboundName := selection.name
 	request, err := h.readUDPOverTCPRequest(conn, destination)
 	if err != nil {
 		h.logOutboundFailure(connectionID, source, destination, startedAt, userFromContext(ctx), outboundName, err)
@@ -120,7 +130,7 @@ func (h *proxyHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, sour
 		return
 	}
 
-	packetConn, err := h.openPacketContext(ctx)
+	packetConn, err := h.openPacketContext(ctx, selection.outbound)
 	if err != nil {
 		h.logOutboundFailure(connectionID, source, request.Destination, startedAt, userFromContext(ctx), outboundName, err)
 		reportHandshakeFailure(conn, err)
@@ -152,7 +162,7 @@ func (h *proxyHandler) handleUDPOverTCP(ctx context.Context, conn net.Conn, sour
 	relayUDPOverTCP(ctx, uotConn, packetConn, closeOnce)
 }
 
-func (h *proxyHandler) dialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+func (h *proxyHandler) dialContext(ctx context.Context, outbound StreamOutbound, destination M.Socksaddr) (net.Conn, error) {
 	if err := validateDestination(destination); err != nil {
 		return nil, err
 	}
@@ -162,10 +172,6 @@ func (h *proxyHandler) dialContext(ctx context.Context, destination M.Socksaddr)
 		defer cancel()
 	}
 
-	outbound, err := h.streamOutboundForUser(ctx)
-	if err != nil {
-		return nil, err
-	}
 	return outbound.DialContext(ctx, destination)
 }
 
@@ -199,47 +205,13 @@ func (h *proxyHandler) logHandshakeSuccessFailure(connectionID uint64, protocol 
 	)
 }
 
-func (h *proxyHandler) openPacketContext(ctx context.Context) (PacketConn, error) {
+func (h *proxyHandler) openPacketContext(ctx context.Context, outbound StreamOutbound) (PacketConn, error) {
 	if timeout := time.Duration(h.config.ConnectTimeout); timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	outbound, err := h.streamOutboundForUser(ctx)
-	if err != nil {
-		return nil, err
-	}
 	return outbound.OpenPacket(ctx)
-}
-
-// outboundForUser resolves the egress module and its log name for the
-// authenticated user carried by ctx. Fallback chain: the user's explicit
-// outbound reference, then the resolved default outbound, then the single
-// configured outbound, then a direct outbound (the last two tiers cover
-// wrappers built by hand without Provision, for example in unit tests). All
-// routing tables are read-only after Provision, so concurrent handlers can
-// call this without locking; repeated calls for one connection are idempotent.
-func (h *proxyHandler) outboundForUser(ctx context.Context) outboundSelection {
-	return h.config.outboundSelectionForUser(userFromContext(ctx))
-}
-
-func (h *proxyHandler) outboundNameForUser(ctx context.Context) string {
-	if selected, ok := streamOutboundFromContext(ctx); ok {
-		return selected.name
-	}
-	return h.outboundForUser(ctx).name
-}
-
-func (h *proxyHandler) streamOutboundForUser(ctx context.Context) (StreamOutbound, error) {
-	if selected, ok := streamOutboundFromContext(ctx); ok {
-		return selected.outbound, nil
-	}
-	selection := h.outboundForUser(ctx)
-	outbound, ok := selection.outbound.(StreamOutbound)
-	if !ok {
-		return nil, fmt.Errorf("outbound %q does not handle local AnyTLS streams", selection.name)
-	}
-	return outbound, nil
 }
 
 func (h *proxyHandler) readUDPOverTCPRequest(conn net.Conn, destination M.Socksaddr) (*uot.Request, error) {

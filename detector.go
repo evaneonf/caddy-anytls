@@ -39,11 +39,6 @@ func newPasswordHashDetector(users []User) passwordHashDetector {
 	return detector
 }
 
-func (d passwordHashDetector) detect(preview []byte) (routingDecision, error) {
-	_, decision, err := d.identify(preview)
-	return decision, err
-}
-
 func (d passwordHashDetector) identify(preview []byte) (string, routingDecision, error) {
 	if len(preview) < 32 {
 		return "", routeFallback, fmt.Errorf("%w: need at least 32 bytes", errShortPreview)

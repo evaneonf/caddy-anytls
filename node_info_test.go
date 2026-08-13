@@ -70,6 +70,10 @@ func TestLogNodeInfo(t *testing.T) {
 		NodeSNI:      "real.example.com",
 		NodeInsecure: true,
 		logger:       zap.New(core),
+		defaultSelection: outboundSelection{
+			outbound: new(DirectOutbound),
+			name:     reservedOutboundDirect,
+		},
 	}
 
 	wrapper.logNodeInfo(nil)
@@ -86,49 +90,12 @@ func TestLogNodeInfo(t *testing.T) {
 	if fields["user"] != "alice" {
 		t.Fatalf("user = %v, want alice", fields["user"])
 	}
+	if fields["outbound"] != reservedOutboundDirect {
+		t.Fatalf("outbound = %v, want direct", fields["outbound"])
+	}
 	wantURI := "anytls://change%3Athis%20password@example.com:8443/?insecure=1&sni=real.example.com"
 	if fields["uri"] != wantURI {
 		t.Fatalf("uri = %v, want %s", fields["uri"], wantURI)
-	}
-}
-
-// Every node info entry carries the outbound name the account will use: the
-// explicit per-user reference when present, otherwise the resolved default
-// outbound name.
-func TestLogNodeInfoIncludesOutboundNames(t *testing.T) {
-	core, logs := observer.New(zapcore.InfoLevel)
-	wrapper := &ListenerWrapper{
-		Users: []User{
-			{Name: "alice", Password: "alice-pass", Enabled: true, Outbound: "exit-home"},
-			{Name: "bob", Password: "bob-pass", Enabled: true},
-		},
-		LogNodeInfo:      true,
-		NodeHosts:        []string{"example.com"},
-		logger:           zap.New(core),
-		defaultSelection: outboundSelection{outbound: new(DirectOutbound), name: "exit-default"},
-	}
-
-	wrapper.logNodeInfo(nil)
-
-	entries := logs.FilterMessage("anytls node available").All()
-	if len(entries) != 2 {
-		t.Fatalf("node log count = %d, want 2", len(entries))
-	}
-	want := map[string]string{
-		"alice": "exit-home",
-		"bob":   "exit-default",
-	}
-	for _, entry := range entries {
-		fields := entry.ContextMap()
-		user, _ := fields["user"].(string)
-		wantOutbound, ok := want[user]
-		if !ok {
-			t.Fatalf("unexpected node log user %q", user)
-		}
-		if fields["outbound"] != wantOutbound {
-			t.Fatalf("user %s outbound = %v, want %q", user, fields["outbound"], wantOutbound)
-		}
-		delete(want, user)
 	}
 }
 

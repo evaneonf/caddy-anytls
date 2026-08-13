@@ -33,10 +33,6 @@ type SOCKS5Outbound struct {
 	dialer contextDialer
 }
 
-type contextDialer interface {
-	DialContext(ctx context.Context, network, address string) (net.Conn, error)
-}
-
 // HandleSession lets the local AnyTLS service decode the session and dispatch
 // each stream through this SOCKS5 proxy.
 func (o *SOCKS5Outbound) HandleSession(_ context.Context, session *OutboundSession) error {
@@ -116,7 +112,7 @@ func (o *SOCKS5Outbound) OpenPacket(ctx context.Context) (PacketConn, error) {
 		return nil, err
 	}
 
-	udpConn, err := o.dialContext(ctx, "udp", bindAddress.String())
+	udpConn, err := o.dialer.DialContext(ctx, "udp", bindAddress.String())
 	if err != nil {
 		_ = controlConn.Close()
 		return nil, fmt.Errorf("connect socks5 UDP relay %s: %w", bindAddress, err)
@@ -127,30 +123,14 @@ func (o *SOCKS5Outbound) OpenPacket(ctx context.Context) (PacketConn, error) {
 }
 
 func (o *SOCKS5Outbound) openControlConnection(ctx context.Context) (net.Conn, error) {
-	serverAddress, err := o.serverAddress()
-	if err != nil {
-		return nil, err
+	if o.dialer == nil || !o.server.IsValid() {
+		return nil, errors.New("socks5 outbound is not provisioned")
 	}
-	conn, err := o.dialContext(ctx, "tcp", serverAddress.String())
+	conn, err := o.dialer.DialContext(ctx, "tcp", o.server.String())
 	if err != nil {
-		return nil, fmt.Errorf("connect socks5 proxy %s: %w", serverAddress, err)
+		return nil, fmt.Errorf("connect socks5 proxy %s: %w", o.server, err)
 	}
 	return conn, nil
-}
-
-func (o *SOCKS5Outbound) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	if o.dialer != nil {
-		return o.dialer.DialContext(ctx, network, address)
-	}
-	var dialer net.Dialer
-	return dialer.DialContext(ctx, network, address)
-}
-
-func (o *SOCKS5Outbound) serverAddress() (M.Socksaddr, error) {
-	if o.server.IsValid() {
-		return o.server, nil
-	}
-	return parseSOCKS5ServerAddress(o.Address)
 }
 
 func parseSOCKS5ServerAddress(rawAddress string) (M.Socksaddr, error) {

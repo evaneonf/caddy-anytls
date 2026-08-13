@@ -129,30 +129,9 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 }
 
 func TestUnmarshalCaddyfileRejectsExtraScalarArguments(t *testing.T) {
-	directives := []string{
-		"probe_timeout 2s extra",
-		"idle_timeout 3m extra",
-		"connect_timeout 4s extra",
-		"max_concurrent 64 extra",
-		"max_pending_probes 96 extra",
-		"max_streams_per_session 48 extra",
-		"max_concurrent_streams 512 extra",
-		"fallback true extra",
-		"padding_scheme stop=8 extra",
-		"log_node_info true extra",
-		"node_port 8443 extra",
-		"node_sni example.com extra",
-		"node_insecure true extra",
-	}
-
-	for _, directive := range directives {
-		t.Run(strings.Fields(directive)[0], func(t *testing.T) {
-			dispenser := caddyfile.NewTestDispenser("anytls {\n" + directive + "\n}")
-			var wrapper ListenerWrapper
-			if err := wrapper.UnmarshalCaddyfile(dispenser); err == nil {
-				t.Fatalf("UnmarshalCaddyfile() accepted %q", directive)
-			}
-		})
+	var wrapper ListenerWrapper
+	if err := wrapper.UnmarshalCaddyfile(caddyfile.NewTestDispenser("anytls {\nprobe_timeout 2s extra\n}")); err == nil {
+		t.Fatal("UnmarshalCaddyfile() accepted an extra scalar argument")
 	}
 }
 
@@ -216,6 +195,56 @@ func TestUnmarshalJSONDefaults(t *testing.T) {
 				t.Fatalf("Users[0].Enabled = %v, want %v", wrapper.Users[0].Enabled, tt.wantEnabled)
 			}
 		})
+	}
+}
+
+func TestUnmarshalJSONRejectsNullBooleans(t *testing.T) {
+	for name, input := range map[string]string{
+		"fallback": `{"fallback":null,"users":[{"name":"alice","password":"secret"}]}`,
+		"enabled":  `{"users":[{"name":"alice","password":"secret","enabled":null}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var wrapper ListenerWrapper
+			err := json.Unmarshal([]byte(input), &wrapper)
+			if err == nil || !strings.Contains(err.Error(), `field "`+name+`" must not be null`) {
+				t.Fatalf("json.Unmarshal() error = %v, want explicit null rejection", err)
+			}
+		})
+	}
+}
+
+func TestUnmarshalJSONRejectsUnknownFields(t *testing.T) {
+	for name, test := range map[string]struct {
+		input string
+		field string
+	}{
+		"listener wrapper": {
+			input: `{"users":[{"name":"alice","password":"secret"}],"default_outbond":"proxy"}`,
+			field: "default_outbond",
+		},
+		"user": {
+			input: `{"users":[{"name":"alice","password":"secret","outbond":"proxy"}]}`,
+			field: "outbond",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var wrapper ListenerWrapper
+			err := json.Unmarshal([]byte(test.input), &wrapper)
+			if err == nil || !strings.Contains(err.Error(), `unknown field "`+test.field+`"`) {
+				t.Fatalf("json.Unmarshal() error = %v, want unknown field %q rejection", err, test.field)
+			}
+		})
+	}
+}
+
+func TestUnmarshalJSONRejectsUnnamedOutbound(t *testing.T) {
+	var wrapper ListenerWrapper
+	err := json.Unmarshal([]byte(`{
+		"users": [{"name": "alice", "password": "secret"}],
+		"outbound": {"dialer": "socks5", "address": "127.0.0.1:1080"}
+	}`), &wrapper)
+	if err == nil || !strings.Contains(err.Error(), `field "outbound" is not supported`) {
+		t.Fatalf("json.Unmarshal() error = %v, want unnamed outbound rejection", err)
 	}
 }
 

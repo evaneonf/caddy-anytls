@@ -42,6 +42,10 @@ type StreamOutbound interface {
 	OpenPacket(ctx context.Context) (PacketConn, error)
 }
 
+type contextDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
 // OutboundSession describes one authenticated AnyTLS session selected for an
 // outbound. Its protocol bytes have only been peeked, not consumed.
 type OutboundSession struct {

@@ -193,7 +193,7 @@ AnyTLS 协议处理复用 `github.com/anytls/sing-anytls`，模块本身只保�
 
 ## 出站扩展点
 
-出站（egress）通过 Caddy guest module 机制可插拔，命名空间为 `caddy.listeners.anytls.outbounds`，inline key 为 `dialer`。所有模块统一实现会话级 `Outbound.HandleSession`。未配置或配置为 `null` 时回退到内置 `direct` 出站。
+出站（egress）通过 Caddy guest module 机制可插拔，命名空间为 `caddy.listeners.anytls.outbounds`，inline key 为 `dialer`。所有模块统一实现会话级 `Outbound.HandleSession`。未配置 `default_outbound` 时使用内置 `direct` 出站；显式的 `null` 模块配置无效。
 
 本机处理型模块还实现流级 `StreamOutbound`（`DialContext` + `OpenPacket`），并在 `HandleSession` 中调用 `OutboundSession.ServeLocal`。内置 `direct` 和 `socks5` 属于这一类。内置 `anytls` 则直接使用 `OutboundSession.Connection` 中继协议会话，不实现流级接口。
 
@@ -207,7 +207,7 @@ AnyTLS 协议处理复用 `github.com/anytls/sing-anytls`，模块本身只保�
 
 保留名 `direct` 不可在 `outbounds` 中声明，它始终指向内置直连出站、无需声明即可被引用。引用未声明的出站名在 `Provision` 阶段报错。无名 `outbound` 不属于配置模型：Caddyfile 必须写成 `outbound <name> <module>`，JSON 必须在 `outbounds` 对象中声明模块。
 
-运行期映射（名→出站、用户→出站）在 `Provision` 内一次性构建、之后只读，拨号路径并发读取无需加锁。
+`Provision` 临时构建名→出站映射来解析引用，运行期只保留默认选择和显式的用户→出站选择；这些选择之后只读，拨号路径并发读取无需加锁。
 
 ### 职责边界
 
@@ -227,6 +227,7 @@ UDP 使用项目定义的 `PacketConn` 小接口，其 `ReadPacket` / `WritePack
 - 本机处理型模块调用 `ServeLocal` 后，由本地 service 管理会话；其 `DialContext` / `OpenPacket` 仍可能被多个 handler goroutine 并发调用。
 - 流级接口返回的 `net.Conn` / `PacketConn` 由 relay 负责关闭；每次调用必须返回独立连接，不得返回共享或缓存的连接。
 - `HandleSession` 的 `ctx` 携带会话取消信号；`OutboundSession.ConnectTimeout()` 给出建连超时。流级 handler 会为 `DialContext` / `OpenPacket` 建立相同的超时上下文。
+- `OutboundSession.User()` 和 `Source()` 分别提供本地认证用户名与入口观察到的客户端地址，供会话级出站记录或选路。
 - `OpenPacket` 返回的连接需要支持向任意未解析目标发送数据报；实现自行决定本地解析、远端解析或其它路由方式。
 - `PacketConn` 的方法返回后不得继续持有调用方提供的字节切片。
 - 会话级中继若消费认证头，必须保留后续协议字节顺序；内置 `anytls` 只替换固定 32 字节密码哈希。

@@ -56,7 +56,6 @@ type ListenerWrapper struct {
 	DefaultOutbound string `json:"default_outbound,omitempty"`
 
 	logger           *zap.Logger
-	namedOutbounds   map[string]Outbound
 	defaultSelection outboundSelection
 	userSelections   map[string]outboundSelection
 	active           int64
@@ -154,7 +153,7 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 // built-in "direct" reserved name, resolves the default outbound, and builds
 // the per-user outbound maps. All reference validation happens here (not in
 // Validate) because ctx.LoadModule zeroes the raw fields and only the loaded
-// namedOutbounds map reflects the declared names. The resulting maps are
+// local map reflects the declared names. The resulting selections are
 // read-only after Provision, so concurrent reads at dial time need no locking.
 func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context) error {
 	// The reserved-name check must run before the built-in "direct" entry is
@@ -168,7 +167,7 @@ func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context) error {
 		}
 	}
 
-	lw.namedOutbounds = make(map[string]Outbound, len(lw.OutboundsRaw)+1)
+	namedOutbounds := make(map[string]Outbound, len(lw.OutboundsRaw)+1)
 	if len(lw.OutboundsRaw) > 0 {
 		mods, err := ctx.LoadModule(lw, "OutboundsRaw")
 		if err != nil {
@@ -183,19 +182,19 @@ func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context) error {
 			if !ok {
 				return fmt.Errorf("named outbound %q: configured module %T is not an anytls outbound", name, mod)
 			}
-			lw.namedOutbounds[name] = outbound
+			namedOutbounds[name] = outbound
 		}
 	}
-	lw.namedOutbounds[reservedOutboundDirect] = new(DirectOutbound)
+	namedOutbounds[reservedOutboundDirect] = new(DirectOutbound)
 
 	if lw.DefaultOutbound != "" {
-		outbound, ok := lw.namedOutbounds[lw.DefaultOutbound]
+		outbound, ok := namedOutbounds[lw.DefaultOutbound]
 		if !ok {
 			return fmt.Errorf("default_outbound %q references an undeclared outbound", lw.DefaultOutbound)
 		}
 		lw.defaultSelection = outboundSelection{outbound: outbound, name: lw.DefaultOutbound}
 	} else {
-		lw.defaultSelection = outboundSelection{outbound: lw.namedOutbounds[reservedOutboundDirect], name: reservedOutboundDirect}
+		lw.defaultSelection = outboundSelection{outbound: namedOutbounds[reservedOutboundDirect], name: reservedOutboundDirect}
 	}
 
 	lw.userSelections = make(map[string]outboundSelection)
@@ -203,7 +202,7 @@ func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context) error {
 		if user.Outbound == "" {
 			continue
 		}
-		outbound, ok := lw.namedOutbounds[user.Outbound]
+		outbound, ok := namedOutbounds[user.Outbound]
 		if !ok {
 			return fmt.Errorf("user %q references an undeclared outbound %q", user.Name, user.Outbound)
 		}
@@ -213,21 +212,11 @@ func (lw *ListenerWrapper) provisionNamedOutbounds(ctx caddy.Context) error {
 	return nil
 }
 
-// defaultOutboundSelection returns the outbound and log name used when the
-// authenticated user has no explicit outbound reference. Provision sets
-// defaultSelection; the direct fallback keeps hand-made test fixtures useful.
-func (lw *ListenerWrapper) defaultOutboundSelection() outboundSelection {
-	if lw.defaultSelection.outbound != nil {
-		return lw.defaultSelection
-	}
-	return outboundSelection{outbound: new(DirectOutbound), name: reservedOutboundDirect}
-}
-
 func (lw *ListenerWrapper) outboundSelectionForUser(user string) outboundSelection {
 	if selection, ok := lw.userSelections[user]; ok {
 		return selection
 	}
-	return lw.defaultOutboundSelection()
+	return lw.defaultSelection
 }
 
 // Cleanup closes all active AnyTLS sessions when the config is unloaded.
@@ -238,7 +227,7 @@ func (lw *ListenerWrapper) outboundSelectionForUser(user string) outboundSelecti
 // cleaned up before or after this runs.
 func (lw *ListenerWrapper) Cleanup() error {
 	if lw.registry != nil {
-		lw.closeActiveSessions("config_unload")
+		lw.closeActiveSessions()
 	}
 	return nil
 }
@@ -326,21 +315,24 @@ func (lw *ListenerWrapper) logFallback(conn net.Conn, err error) {
 	)
 }
 
-func (lw *ListenerWrapper) prepareWebsiteConn(conn *bufferedConn) (net.Conn, error) {
-	prefix, err := conn.BufferedBytes()
-	if err != nil {
-		return nil, err
-	}
-
-	websiteConn := newPrependConn(conn.Conn, prefix)
+func (lw *ListenerWrapper) prepareWebsiteConn(conn *bufferedConn) net.Conn {
 	if stater, ok := conn.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
 		return tlsStateConn{
-			Conn:  websiteConn,
+			Conn:  conn,
 			state: stater.ConnectionState(),
-		}, nil
+		}
 	}
 
-	return websiteConn, nil
+	return conn
+}
+
+type tlsStateConn struct {
+	net.Conn
+	state tls.ConnectionState
+}
+
+func (c tlsStateConn) ConnectionState() tls.ConnectionState {
+	return c.state
 }
 
 var (

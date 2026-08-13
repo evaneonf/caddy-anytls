@@ -20,7 +20,6 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	M "github.com/sagernet/sing/common/metadata"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest/observer"
 )
 
 func newTestWrapper(t *testing.T, users []User) *ListenerWrapper {
@@ -32,6 +31,7 @@ func newTestWrapper(t *testing.T, users []User) *ListenerWrapper {
 		IdleTimeout:      caddy.Duration(2 * time.Second),
 		ConnectTimeout:   caddy.Duration(time.Second),
 		MaxConcurrent:    8,
+		MaxPendingProbes: 256,
 		Fallback:         true,
 		PaddingScheme:    string(padding.DefaultPaddingScheme),
 		logger:           zap.NewNop(),
@@ -55,8 +55,7 @@ func newTestWrapper(t *testing.T, users []User) *ListenerWrapper {
 }
 
 // newTestAnyTLSClient builds a sing-anytls client whose outgoing connections
-// are enqueued on the given chanListener, mirroring the inline client setup
-// used across the integration tests.
+// are enqueued on the given chanListener.
 func newTestAnyTLSClient(t *testing.T, base *chanListener, password string) *singanytls.Client {
 	t.Helper()
 
@@ -112,23 +111,14 @@ func newTestCertificate(t *testing.T) tls.Certificate {
 	}
 }
 
-func acceptLoop(ctx context.Context, l net.Listener) {
+func acceptLoop(l net.Listener) {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
 			return
 		}
 		_ = conn.Close()
 	}
-}
-
-func waitForLogs(logs *observer.ObservedLogs, message string) bool {
-	return waitForCondition(500*time.Millisecond, func() bool {
-		return logs.FilterMessage(message).Len() > 0
-	})
 }
 
 func testActiveSessionCount(wrapper *ListenerWrapper) int {
@@ -156,15 +146,6 @@ type chanListener struct {
 	connCh chan net.Conn
 	once   sync.Once
 	closed chan struct{}
-}
-
-type testTLSStateConn struct {
-	net.Conn
-	state tls.ConnectionState
-}
-
-func (c testTLSStateConn) ConnectionState() tls.ConnectionState {
-	return c.state
 }
 
 type handshakeReportConn struct {
@@ -211,25 +192,6 @@ func (d anyTLSTestDialer) DialContext(ctx context.Context, network string, desti
 
 func (d anyTLSTestDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	return nil, errors.New("not implemented in tests")
-}
-
-type stateCheckingListener struct {
-	net.Listener
-	seenCh chan net.Conn
-	errCh  chan error
-}
-
-func (l *stateCheckingListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	if _, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); !ok {
-		l.errCh <- errors.New("missing ConnectionState")
-	} else {
-		l.seenCh <- conn
-	}
-	return conn, nil
 }
 
 func newChanListener() *chanListener {

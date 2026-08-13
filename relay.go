@@ -2,9 +2,9 @@ package anytls
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
-	"sync"
 	"sync/atomic"
 
 	N "github.com/sagernet/sing/common/network"
@@ -41,32 +41,41 @@ func (c *countingConn) BytesWritten() int64 {
 }
 
 func relay(ctx context.Context, inbound net.Conn, outbound net.Conn, onClose N.CloseHandlerFunc) {
-	var once sync.Once
-	done := make(chan struct{})
-	closeAll := func(err error) {
-		once.Do(func() {
-			close(done)
-			if onClose != nil {
-				onClose(err)
-			}
-			_ = inbound.Close()
-			_ = outbound.Close()
-		})
-	}
-
 	go func() {
-		select {
-		case <-ctx.Done():
-			closeAll(ctx.Err())
-		case <-done:
-		}
+		_ = relayConnections(ctx, inbound, outbound, onClose)
 	}()
-
-	go proxyCopy(inbound, outbound, closeAll)
-	go proxyCopy(outbound, inbound, closeAll)
 }
 
-func proxyCopy(dst net.Conn, src net.Conn, closeAll func(error)) {
-	_, err := io.Copy(dst, src)
-	closeAll(err)
+func relayConnections(ctx context.Context, inbound net.Conn, outbound net.Conn, onClose N.CloseHandlerFunc) error {
+	results := make(chan error, 2)
+	copyConn := func(dst net.Conn, src net.Conn) {
+		_, err := io.Copy(dst, src)
+		results <- err
+	}
+	go copyConn(outbound, inbound)
+	go copyConn(inbound, outbound)
+
+	var firstErr error
+	select {
+	case firstErr = <-results:
+	case <-ctx.Done():
+		firstErr = ctx.Err()
+	}
+	if onClose != nil {
+		onClose(firstErr)
+	}
+	_ = inbound.Close()
+	_ = outbound.Close()
+
+	select {
+	case secondErr := <-results:
+		if firstErr == nil {
+			firstErr = secondErr
+		}
+	case <-ctx.Done():
+	}
+	if errors.Is(firstErr, io.EOF) || errors.Is(firstErr, net.ErrClosed) {
+		return nil
+	}
+	return firstErr
 }

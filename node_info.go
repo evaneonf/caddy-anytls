@@ -31,10 +31,7 @@ func (lw *ListenerWrapper) logNodeInfo(server *caddyhttp.Server) {
 		if !user.Enabled {
 			continue
 		}
-		outboundName := user.Outbound
-		if outboundName == "" {
-			outboundName = lw.defaultOutboundSelection().name
-		}
+		outboundName := lw.outboundSelectionForUser(user.Name).name
 		for _, host := range hosts {
 			sni := lw.NodeSNI
 			if sni == "" {

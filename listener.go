@@ -27,16 +27,12 @@ type wrappedListener struct {
 }
 
 func newWrappedListener(listener net.Listener, config *ListenerWrapper) *wrappedListener {
-	maxPending := config.MaxPendingProbes
-	if maxPending <= 0 {
-		maxPending = 256
-	}
 	return &wrappedListener{
 		Listener:   listener,
 		config:     config,
 		done:       make(chan struct{}),
 		ready:      make(chan net.Conn),
-		probeSlots: make(chan struct{}, maxPending),
+		probeSlots: make(chan struct{}, config.MaxPendingProbes),
 	}
 }
 
@@ -121,22 +117,10 @@ func (wl *wrappedListener) classifyAcceptedConn(conn net.Conn, connectionID uint
 			_ = conn.Close()
 			return nil, nil
 		}
-		buffered := newBufferedConn(tlsConn)
-		websiteConn, handled, err := wl.routeBufferedConn(conn, buffered, connectionID, wl.config.prepareWebsiteConn)
-		if err != nil || handled {
-			return nil, err
-		}
-		return websiteConn, nil
 	}
 
 	buffered := newBufferedConn(conn)
-	websiteConn, handled, err := wl.routeBufferedConn(conn, buffered, connectionID, func(conn *bufferedConn) (net.Conn, error) {
-		return conn, nil
-	})
-	if err != nil || handled {
-		return nil, err
-	}
-	return websiteConn, nil
+	return wl.routeBufferedConn(conn, buffered, connectionID)
 }
 
 func (wl *wrappedListener) stop(err error) {
@@ -157,16 +141,13 @@ func (wl *wrappedListener) getTerminalError() error {
 	return wl.terminalErr
 }
 
-func (wl *wrappedListener) routeBufferedConn(rawConn net.Conn, buffered *bufferedConn, connectionID uint64, fallbackConn func(*bufferedConn) (net.Conn, error)) (net.Conn, bool, error) {
-	decision, detectErr := wl.classifyBufferedConn(buffered)
+func (wl *wrappedListener) routeBufferedConn(rawConn net.Conn, buffered *bufferedConn, connectionID uint64) (net.Conn, error) {
+	route, detectErr := wl.classifyBufferedConn(buffered)
+	decision := route.decision
 	if detectErr != nil {
 		if decision == routeFallback && wl.config.Fallback {
 			wl.config.logFallback(rawConn, detectErr)
-			conn, err := fallbackConn(buffered)
-			if err != nil {
-				return nil, false, fmt.Errorf("prepare fallback connection: %w", err)
-			}
-			return conn, false, nil
+			return wl.config.prepareWebsiteConn(buffered), nil
 		}
 		wl.config.logger.Warn("connection rejected during anytls probe",
 			zap.Uint64("connection_id", connectionID),
@@ -177,7 +158,7 @@ func (wl *wrappedListener) routeBufferedConn(rawConn net.Conn, buffered *buffere
 			zap.Error(detectErr),
 		)
 		_ = rawConn.Close()
-		return nil, true, nil
+		return nil, nil
 	}
 
 	switch decision {
@@ -189,27 +170,14 @@ func (wl *wrappedListener) routeBufferedConn(rawConn net.Conn, buffered *buffere
 			zap.String("outcome", "fallback"),
 			zap.String("reason", "website_protocol"),
 		)
-		conn, err := fallbackConn(buffered)
-		if err != nil {
-			return nil, false, fmt.Errorf("prepare fallback connection: %w", err)
-		}
-		return conn, false, nil
-	case routeReject:
-		wl.config.logger.Warn("connection rejected by anytls detector",
-			zap.Uint64("connection_id", connectionID),
-			zap.String("remote", rawConn.RemoteAddr().String()),
-			zap.String("event", "anytls_probe"),
-			zap.String("outcome", "rejected"),
-		)
-		_ = rawConn.Close()
-		return nil, true, nil
+		return wl.config.prepareWebsiteConn(buffered), nil
 	case routeAnyTLS:
 		if !wl.config.acquire() {
 			wl.config.logger.Warn("rejecting AnyTLS connection due to concurrency limit",
 				zap.String("remote", rawConn.RemoteAddr().String()),
 			)
 			_ = rawConn.Close()
-			return nil, true, nil
+			return nil, nil
 		}
 		wl.config.logger.Debug("connection detected as anytls",
 			zap.Uint64("connection_id", connectionID),
@@ -217,15 +185,10 @@ func (wl *wrappedListener) routeBufferedConn(rawConn net.Conn, buffered *buffere
 			zap.String("event", "anytls_probe"),
 			zap.String("outcome", "anytls"),
 		)
-		go wl.serveAnyTLS(buffered, connectionID)
-		return nil, true, nil
-	default:
-		conn, err := fallbackConn(buffered)
-		if err != nil {
-			return nil, false, fmt.Errorf("prepare fallback connection: %w", err)
-		}
-		return conn, false, nil
+		go wl.serveAnyTLS(buffered, connectionID, route.user)
+		return nil, nil
 	}
+	return nil, fmt.Errorf("unknown routing decision %d", decision)
 }
 
 func (wl *wrappedListener) handshakeTLSConn(conn *tls.Conn) error {
@@ -246,31 +209,44 @@ func (wl *wrappedListener) handshakeTLSConn(conn *tls.Conn) error {
 	return conn.Handshake()
 }
 
-func (wl *wrappedListener) classifyBufferedConn(conn *bufferedConn) (routingDecision, error) {
-	if decision, ok, err := wl.classifyWebsiteFastPath(conn); ok || err != nil {
-		return decision, err
+type classifiedRoute struct {
+	decision routingDecision
+	user     string
+}
+
+func (wl *wrappedListener) classifyBufferedConn(conn *bufferedConn) (classifiedRoute, error) {
+	if website, err := wl.classifyWebsiteFastPath(conn); website || err != nil {
+		return classifiedRoute{decision: routeFallback}, err
 	}
 
 	preview, err := conn.Peek(32, time.Duration(wl.config.ProbeTimeout))
 	if err != nil && !errors.Is(err, net.ErrClosed) {
-		return routeFallback, fmt.Errorf("peek first bytes: %w", err)
+		return classifiedRoute{decision: routeFallback}, fmt.Errorf("peek first bytes: %w", err)
 	}
-	return wl.classifyPreview(preview)
+	if len(preview) == 0 {
+		return classifiedRoute{decision: routeFallback}, nil
+	}
+
+	user, decision, err := wl.config.detector.identify(preview)
+	if err != nil {
+		err = fmt.Errorf("detect anytls: %w", err)
+	}
+	return classifiedRoute{decision: decision, user: user}, err
 }
 
-func (wl *wrappedListener) classifyWebsiteFastPath(conn *bufferedConn) (routingDecision, bool, error) {
+func (wl *wrappedListener) classifyWebsiteFastPath(conn *bufferedConn) (bool, error) {
 	first, err := conn.Peek(1, time.Duration(wl.config.ProbeTimeout))
 	if err != nil {
 		if errors.Is(err, net.ErrClosed) {
-			return routeFallback, true, nil
+			return true, nil
 		}
-		return routeFallback, false, fmt.Errorf("peek first byte: %w", err)
+		return false, fmt.Errorf("peek first byte: %w", err)
 	}
 	switch first[0] {
 	case 'P':
 		preview, err := conn.Peek(4, time.Duration(wl.config.ProbeTimeout))
 		if err != nil {
-			return routeFallback, false, fmt.Errorf("peek website prefix: %w", err)
+			return false, fmt.Errorf("peek website prefix: %w", err)
 		}
 		switch string(preview) {
 		case "POST":
@@ -278,7 +254,7 @@ func (wl *wrappedListener) classifyWebsiteFastPath(conn *bufferedConn) (routingD
 		case "PRI ":
 			return wl.matchWebsitePrefix(conn, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 		}
-		return routeFallback, false, nil
+		return false, nil
 	case 'G':
 		return wl.matchWebsitePrefix(conn, "GET ")
 	case 'H':
@@ -300,7 +276,7 @@ func (wl *wrappedListener) classifyWebsiteFastPath(conn *bufferedConn) (routingD
 	case 'S':
 		preview, err := conn.Peek(3, time.Duration(wl.config.ProbeTimeout))
 		if err != nil {
-			return routeFallback, false, fmt.Errorf("peek website prefix: %w", err)
+			return false, fmt.Errorf("peek website prefix: %w", err)
 		}
 		switch string(preview) {
 		case "SUB":
@@ -308,7 +284,7 @@ func (wl *wrappedListener) classifyWebsiteFastPath(conn *bufferedConn) (routingD
 		case "SEA":
 			return wl.matchWebsitePrefix(conn, "SEARCH ")
 		}
-		return routeFallback, false, nil
+		return false, nil
 	case 'U':
 		return wl.matchWebsitePrefix(conn, "UNSUBSCRIBE ")
 	case 'L':
@@ -318,59 +294,26 @@ func (wl *wrappedListener) classifyWebsiteFastPath(conn *bufferedConn) (routingD
 	case 'B':
 		return wl.matchWebsitePrefix(conn, "BIND ")
 	}
-	return routeFallback, false, nil
+	return false, nil
 }
 
-func (wl *wrappedListener) matchWebsitePrefix(conn *bufferedConn, prefix string) (routingDecision, bool, error) {
+func (wl *wrappedListener) matchWebsitePrefix(conn *bufferedConn, prefix string) (bool, error) {
 	preview, err := conn.Peek(len(prefix), time.Duration(wl.config.ProbeTimeout))
 	if err != nil {
 		if errors.Is(err, net.ErrClosed) {
-			return routeFallback, true, nil
+			return true, nil
 		}
-		return routeFallback, false, fmt.Errorf("peek website prefix: %w", err)
+		return false, fmt.Errorf("peek website prefix: %w", err)
 	}
 	if string(preview) == prefix {
-		return routeFallback, true, nil
+		return true, nil
 	}
-	return routeFallback, false, nil
+	return false, nil
 }
 
-func (wl *wrappedListener) classifyPreview(preview []byte) (routingDecision, error) {
-	if len(preview) == 0 {
-		return routeFallback, nil
-	}
-
-	decision, detectErr := wl.config.detector.detect(preview)
-	if detectErr != nil {
-		return decision, fmt.Errorf("detect anytls: %w", detectErr)
-	}
-
-	return decision, nil
-}
-
-func (wl *wrappedListener) serveAnyTLS(buffered *bufferedConn, connectionID uint64) {
+func (wl *wrappedListener) serveAnyTLS(buffered *bufferedConn, connectionID uint64, user string) {
 	defer wl.config.release()
 	startedAt := time.Now()
-	preview, err := buffered.Peek(32, time.Duration(wl.config.ProbeTimeout))
-	if err != nil {
-		wl.config.logger.Debug("anytls session identification failed",
-			zap.Uint64("connection_id", connectionID),
-			zap.String("remote", buffered.RemoteAddr().String()),
-			zap.Error(err),
-		)
-		_ = buffered.Close()
-		return
-	}
-	user, decision, err := wl.config.detector.identify(preview)
-	if err != nil || decision != routeAnyTLS {
-		wl.config.logger.Debug("anytls session identification failed",
-			zap.Uint64("connection_id", connectionID),
-			zap.String("remote", buffered.RemoteAddr().String()),
-			zap.Error(err),
-		)
-		_ = buffered.Close()
-		return
-	}
 	selection := wl.config.outboundSelectionForUser(user)
 
 	conn := newIdleTimeoutConn(buffered, time.Duration(wl.config.IdleTimeout))
@@ -379,8 +322,7 @@ func (wl *wrappedListener) serveAnyTLS(buffered *bufferedConn, connectionID uint
 	baseCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ctx := contextWithConnectionID(baseCtx, connectionID)
-	wl.config.registerSession(connectionID, conn, cancel)
-	wl.config.updateSessionUser(connectionID, user)
+	wl.config.registerSession(connectionID, conn, cancel, user)
 	defer wl.config.unregisterSession(connectionID)
 	wl.config.logger.Info("anytls session authenticated",
 		zap.Uint64("connection_id", connectionID),
@@ -416,7 +358,7 @@ func (wl *wrappedListener) serveAnyTLS(buffered *bufferedConn, connectionID uint
 		selectedCtx := contextWithStreamOutbound(ctx, selection.name, streamOutbound)
 		return wl.config.service.NewConnection(selectedCtx, conn, source, onClose)
 	})
-	err = selection.outbound.HandleSession(ctx, session)
+	err := selection.outbound.HandleSession(ctx, session)
 	if err != nil && !errors.Is(err, io.EOF) {
 		wl.config.logger.Debug("anytls session finished",
 			zap.Uint64("connection_id", connectionID),
