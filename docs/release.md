@@ -43,6 +43,31 @@
 - 确认许可证文件与仓库说明一致
 - 确认文档没有承诺当前尚未实现的能力
 
+## 发布流程
+
+版本发布由 [Docker workflow](../.github/workflows/docker.yml) 自动完成。确认 `main` 已推送且检查通过后，创建并推送 `v*` 标签：
+
+```sh
+git tag -a vX.Y.Z -m "Release vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+标签触发完整检查，并构建 `linux/amd64`、`linux/arm64` 的 `core` 与 `wireguard` 镜像。两个多架构 manifest 都发布成功后，工作流才会创建 GitHub Release；Release 说明包含固定版本镜像、滚动标签以及从上一个版本起的提交列表。工作流重跑时不会重复创建已经存在的 Release。
+
+版本标签对应的镜像如下：
+
+```text
+ghcr.io/evaneonf/caddy-anytls:vX.Y.Z
+ghcr.io/evaneonf/caddy-anytls:vX.Y.Z-wireguard
+```
+
+成功发布版本标签时还会更新：
+
+```text
+ghcr.io/evaneonf/caddy-anytls:latest
+ghcr.io/evaneonf/caddy-anytls:wireguard
+```
+
 ## 当前边界
 
 当前尚未覆盖的范围：

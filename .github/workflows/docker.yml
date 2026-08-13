@@ -379,3 +379,98 @@ jobs:
         run: |
           tag="$(jq -r '.tags[0]' <<< "$METADATA")"
           docker buildx imagetools inspect "$tag"
+
+  release:
+    name: GitHub Release
+    needs: docker-merge
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          previous_tag="$(git describe \
+            --tags \
+            --abbrev=0 \
+            "${GITHUB_SHA}^" 2>/dev/null || true)"
+
+          {
+            echo "## Container images"
+            echo
+            echo "### Core"
+            echo
+            echo '```sh'
+            echo "docker pull ${IMAGE}:${TAG}"
+            echo '```'
+            echo
+            echo "### WireGuard"
+            echo
+            echo '```sh'
+            echo "docker pull ${IMAGE}:${TAG}-wireguard"
+            echo '```'
+            echo
+            echo "Rolling tags:"
+            echo
+            echo "- \`${IMAGE}:latest\`"
+            echo "- \`${IMAGE}:wireguard\`"
+            echo
+            echo "## Changes"
+            echo
+
+            if [ -n "$previous_tag" ]; then
+              git log \
+                --no-merges \
+                --pretty='- %s (`%h`)' \
+                "${previous_tag}..${GITHUB_SHA}"
+            else
+              git log \
+                --no-merges \
+                --pretty='- %s (`%h`)'
+            fi
+          } > release-notes.md
+
+      - name: Create GitHub Release
+        uses: actions/github-script@v9
+        env:
+          TAG: ${{ github.ref_name }}
+        with:
+          script: |
+            const fs = require("fs");
+            const tag = process.env.TAG;
+            const body = fs.readFileSync("release-notes.md", "utf8");
+
+            try {
+              await github.rest.repos.getReleaseByTag({
+                ...context.repo,
+                tag,
+              });
+              core.info(`Release ${tag} already exists`);
+              return;
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+
+            await github.rest.repos.createRelease({
+              ...context.repo,
+              tag_name: tag,
+              target_commitish: context.sha,
+              name: tag,
+              body,
+              draft: false,
+              prerelease: false,
+              make_latest: "true",
+            });
