@@ -3,7 +3,7 @@ module github.com/evaneonf/caddy-anytls
 go 1.26
 
 require (
-	github.com/anytls/sing-anytls v0.0.11
+	github.com/anytls/sing-anytls v0.0.13
 	github.com/caddyserver/caddy/v2 v2.11.4
 	github.com/sagernet/sing v0.8.11
 	go.uber.org/zap v1.28.0
