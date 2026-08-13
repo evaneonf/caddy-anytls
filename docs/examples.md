@@ -14,21 +14,21 @@ xcaddy build --with github.com/evaneonf/caddy-anytls=.
 
 ```caddyfile
 {
-    servers :443 {
-        listener_wrappers {
-            anytls {
-                user phone-1 replace-with-strong-password
-                user laptop-1 replace-with-another-password
-                log_node_info true
-                node_host example.com
-            }
-        }
-    }
+	servers :443 {
+		listener_wrappers {
+			anytls {
+				user phone-1 replace-with-strong-password
+				user laptop-1 replace-with-another-password
+				log_node_info true
+				node_host example.com
+			}
+		}
+	}
 }
 
 example.com {
-    header -Server
-    respond "server is running"
+	header -Server
+	respond "server is running"
 }
 ```
 
@@ -51,32 +51,32 @@ example.com {
 
 ```caddyfile
 {
-    servers :443 {
-        listener_wrappers {
-            anytls {
-                probe_timeout 5s
-                idle_timeout 2m
-                connect_timeout 10s
-                max_concurrent 128
-                max_pending_probes 256
-                max_streams_per_session 256
-                max_concurrent_streams 1024
-                fallback true
-                allow_private_targets false
+	servers :443 {
+		listener_wrappers {
+			anytls {
+				probe_timeout 5s
+				idle_timeout 2m
+				connect_timeout 10s
+				max_concurrent 128
+				max_pending_probes 256
+				max_streams_per_session 256
+				max_concurrent_streams 1024
+				fallback true
+				allow_private_targets false
 
-                deny_port 25
-                deny_cidr 127.0.0.0/8 169.254.0.0/16
-                deny_domain .blocked.example
+				deny_port 25
+				deny_cidr 127.0.0.0/8 169.254.0.0/16
+				deny_domain .blocked.example
 
-                user phone-1 replace-with-strong-password
-                user laptop-1 replace-with-another-password
-            }
-        }
-    }
+				user phone-1 replace-with-strong-password
+				user laptop-1 replace-with-another-password
+			}
+		}
+	}
 }
 
 example.com {
-    respond "server is running"
+	respond "server is running"
 }
 ```
 
@@ -177,9 +177,9 @@ example.com {
 
 ```caddyfile
 anytls {
-    user phone-1 replace-with-strong-password
-    log_node_info true
-    node_host example.com
+	user phone-1 replace-with-strong-password
+	log_node_info true
+	node_host example.com
 }
 ```
 
@@ -224,32 +224,32 @@ WireGuard 的密钥、端点、地址和 DNS 属于出口资源，先在全局�
 
 ```caddyfile
 {
-    wireguard {
-        tunnel home {
-            private_key          <base64 客户端私钥>
-            peer_public_key      <base64 服务端公钥>
-            endpoint             home.example.com:51820
-            address              10.7.0.2
-            allowed_ips          0.0.0.0/0 ::/0
-            dns                  1.1.1.1
-            persistent_keepalive 25
-        }
-    }
+	wireguard {
+		tunnel home {
+			private_key <base64 客户端私钥>
+			peer_public_key <base64 服务端公钥>
+			endpoint home.example.com:51820
+			address 10.7.0.2
+			allowed_ips 0.0.0.0/0 ::/0
+			dns 1.1.1.1
+			persistent_keepalive 25
+		}
+	}
 
-    servers :443 {
-        listener_wrappers {
-            anytls {
-                user phone-1 replace-with-strong-password
-                outbound wireguard {
-                    tunnel home
-                }
-            }
-        }
-    }
+	servers :443 {
+		listener_wrappers {
+			anytls {
+				user phone-1 replace-with-strong-password
+				outbound wireguard {
+					tunnel home
+				}
+			}
+		}
+	}
 }
 
 example.com {
-    respond "server is running"
+	respond "server is running"
 }
 ```
 
@@ -271,28 +271,28 @@ example.com {
 
 ```caddyfile
 {
-    servers :443 {
-        listener_wrappers {
-            anytls {
-                # 具名出站：outbound <name> <module> { ...模块配置... }
-                outbound wg-home wireguard {
-                    tunnel home
-                }
+	servers :443 {
+		listener_wrappers {
+			anytls {
+				# 具名出站：outbound <name> <module> { ...模块配置... }
+				outbound wg-home wireguard {
+					tunnel home
+				}
 
-                # 默认出站（可选）：未标注出站的用户走它
-                default_outbound wg-home
+				# 默认出站（可选）：未标注出站的用户走它
+				default_outbound wg-home
 
-                # user <name> <password> [outbound-name]
-                user phone-home   replace-with-password-1          # -> 默认（wg-home）
-                user phone-direct replace-with-password-2 direct   # -> 内置直连
-                user laptop       replace-with-password-3 wg-home  # 显式引用
-            }
-        }
-    }
+				# user <name> <password> [outbound-name]
+				user phone-home replace-with-password-1 # -> 默认（wg-home）
+				user phone-direct replace-with-password-2 direct # -> 内置直连
+				user laptop replace-with-password-3 wg-home # 显式引用
+			}
+		}
+	}
 }
 
 example.com {
-    respond "server is running"
+	respond "server is running"
 }
 ```
 

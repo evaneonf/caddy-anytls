@@ -1,8 +1,10 @@
 package anytls
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -14,6 +16,49 @@ import (
 	_ "github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"go.uber.org/zap"
 )
+
+func TestCaddyfileExamplesAreFormatted(t *testing.T) {
+	for _, path := range []string{"config/Caddyfile", "testdata/wireguard.Caddyfile"} {
+		input, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("os.ReadFile(%q) error = %v", path, err)
+		}
+		if formatted := caddyfile.Format(input); !bytes.Equal(input, formatted) {
+			t.Errorf("%s is not formatted; run caddy fmt --overwrite %s", path, path)
+		}
+	}
+
+	for _, path := range []string{"README.md", "docs/examples.md"} {
+		input, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("os.ReadFile(%q) error = %v", path, err)
+		}
+
+		var block strings.Builder
+		inCaddyfile := false
+		blockLine := 0
+		for lineNumber, line := range strings.SplitAfter(string(input), "\n") {
+			marker := strings.TrimSpace(line)
+			switch {
+			case !inCaddyfile && marker == "```caddyfile":
+				inCaddyfile = true
+				blockLine = lineNumber + 2
+			case inCaddyfile && marker == "```":
+				contents := []byte(block.String())
+				if formatted := caddyfile.Format(contents); !bytes.Equal(contents, formatted) {
+					t.Errorf("%s:%d Caddyfile example is not formatted", path, blockLine)
+				}
+				block.Reset()
+				inCaddyfile = false
+			case inCaddyfile:
+				block.WriteString(line)
+			}
+		}
+		if inCaddyfile {
+			t.Errorf("%s:%d has an unterminated Caddyfile block", path, blockLine)
+		}
+	}
+}
 
 func TestUnmarshalCaddyfile(t *testing.T) {
 	dispenser := caddyfile.NewTestDispenser(`
