@@ -26,14 +26,13 @@ func newTestWrapper(t *testing.T, users []User) *ListenerWrapper {
 	t.Helper()
 
 	wrapper := &ListenerWrapper{
+		SNI:              "example.test",
 		Users:            users,
 		ProbeTimeout:     caddy.Duration(250 * time.Millisecond),
 		IdleTimeout:      caddy.Duration(2 * time.Second),
 		ConnectTimeout:   caddy.Duration(time.Second),
 		MaxConcurrent:    8,
 		MaxPendingProbes: 256,
-		Fallback:         true,
-		PaddingScheme:    string(padding.DefaultPaddingScheme),
 		logger:           zap.NewNop(),
 		registry:         newSessionRegistry(),
 		defaultSelection: outboundSelection{outbound: new(DirectOutbound), name: reservedOutboundDirect},
@@ -41,7 +40,7 @@ func newTestWrapper(t *testing.T, users []User) *ListenerWrapper {
 	wrapper.detector = newPasswordHashDetector(wrapper.Users)
 
 	service, err := singanytls.NewService(singanytls.ServiceConfig{
-		PaddingScheme: []byte(wrapper.PaddingScheme),
+		PaddingScheme: []byte(padding.DefaultPaddingScheme),
 		Users:         wrapper.anyTLSUsers(),
 		Handler:       &proxyHandler{config: wrapper},
 		Logger:        zapLogger{base: wrapper.logger},
@@ -59,7 +58,7 @@ func newTestWrapper(t *testing.T, users []User) *ListenerWrapper {
 func newTestAnyTLSClient(t *testing.T, base *chanListener, password string) *singanytls.Client {
 	t.Helper()
 
-	client, err := singanytls.NewClient(context.Background(), singanytls.ClientConfig{
+	client, err := singanytls.NewClient(t.Context(), singanytls.ClientConfig{
 		Password:                 password,
 		IdleSessionCheckInterval: 100 * time.Millisecond,
 		IdleSessionTimeout:       time.Second,
@@ -214,7 +213,8 @@ func (l *chanListener) Accept() (net.Conn, error) {
 	case <-l.closed:
 		return nil, net.ErrClosed
 	case conn := <-l.connCh:
-		return conn, nil
+		// Model Caddy's decrypted TLS connection for in-memory protocol tests.
+		return tlsStateConn{Conn: conn, state: tls.ConnectionState{HandshakeComplete: true, ServerName: "example.test"}}, nil
 	}
 }
 

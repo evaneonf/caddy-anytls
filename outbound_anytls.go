@@ -127,28 +127,16 @@ func (o *AnyTLSOutbound) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.NextBlock(0) {
 		switch d.Val() {
 		case "address":
-			if o.Address != "" || !d.NextArg() {
-				return d.ArgErr()
-			}
-			o.Address = d.Val()
-			if d.NextArg() {
-				return d.ArgErr()
+			if err := parseUniqueStringDirective(d, &o.Address); err != nil {
+				return err
 			}
 		case "password":
-			if o.Password != "" || !d.NextArg() {
-				return d.ArgErr()
-			}
-			o.Password = d.Val()
-			if d.NextArg() {
-				return d.ArgErr()
+			if err := parseUniqueStringDirective(d, &o.Password); err != nil {
+				return err
 			}
 		case "server_name":
-			if o.ServerName != "" || !d.NextArg() {
-				return d.ArgErr()
-			}
-			o.ServerName = d.Val()
-			if d.NextArg() {
-				return d.ArgErr()
+			if err := parseUniqueStringDirective(d, &o.ServerName); err != nil {
+				return err
 			}
 		case "tls_insecure_skip_verify":
 			if o.TLSInsecureSkipVerify || d.NextArg() {

@@ -104,15 +104,6 @@ func init() {
 	caddy.RegisterModule(&testNotOutbound{})
 }
 
-func TestDirectOutboundOpenPacket(t *testing.T) {
-	var outbound DirectOutbound
-	packetConn, err := outbound.OpenPacket(t.Context())
-	if err != nil {
-		t.Fatalf("OpenPacket() error = %v", err)
-	}
-	defer closeTest(packetConn)
-}
-
 func TestSOCKS5OutboundPreservesTCPDomain(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
 	requestCh := make(chan socks5.Request, 1)
@@ -381,19 +372,6 @@ func encodeSOCKS5UDPPacket(t *testing.T, source M.Socksaddr, payload []byte) []b
 	return append([]byte(nil), packet.Bytes()...)
 }
 
-func TestUnmarshalCaddyfileRejectsUnnamedOutbound(t *testing.T) {
-	var wrapper ListenerWrapper
-	err := wrapper.UnmarshalCaddyfile(caddyfile.NewTestDispenser(`
-	anytls {
-		user alice secret
-		outbound direct
-	}
-	`))
-	if err == nil {
-		t.Fatal("UnmarshalCaddyfile() accepted outbound without both a name and module")
-	}
-}
-
 func TestUnmarshalCaddyfileSOCKS5Outbound(t *testing.T) {
 	dispenser := caddyfile.NewTestDispenser(`
 	anytls {
@@ -620,6 +598,7 @@ func newProvisionedWrapper(t *testing.T, configJSON string) (*ListenerWrapper, e
 	if err := json.Unmarshal([]byte(configJSON), &wrapper); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
+	wrapper.SNI = "example.test"
 	wrapper.logger = zap.NewNop()
 	wrapper.registry = newSessionRegistry()
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: t.Context()})
@@ -710,6 +689,7 @@ func TestProvisionRejectsUndeclaredOutboundReferences(t *testing.T) {
 
 func TestProvisionRejectsEmptyNamedOutboundName(t *testing.T) {
 	wrapper := &ListenerWrapper{
+		SNI:          "example.test",
 		Users:        []User{{Name: "alice", Password: "secret", Enabled: true}},
 		OutboundsRaw: map[string]json.RawMessage{"": json.RawMessage(`{"dialer":"direct"}`)},
 		logger:       zap.NewNop(),

@@ -5,11 +5,11 @@ package anytls
 
 import (
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -17,7 +17,6 @@ import (
 	"github.com/anytls/sing-anytls/padding"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 )
 
@@ -29,6 +28,7 @@ func init() {
 // decide whether the connection should be handled as AnyTLS or returned to the
 // normal website path.
 type ListenerWrapper struct {
+	SNI                  string         `json:"sni,omitempty"`
 	Users                []User         `json:"users,omitempty"`
 	ProbeTimeout         caddy.Duration `json:"probe_timeout,omitempty"`
 	IdleTimeout          caddy.Duration `json:"idle_timeout,omitempty"`
@@ -37,13 +37,7 @@ type ListenerWrapper struct {
 	MaxPendingProbes     int            `json:"max_pending_probes,omitempty"`
 	MaxStreamsPerSession int            `json:"max_streams_per_session,omitempty"`
 	MaxConcurrentStreams int            `json:"max_concurrent_streams,omitempty"`
-	Fallback             bool           `json:"fallback,omitempty"`
-	PaddingScheme        string         `json:"padding_scheme,omitempty"`
 	LogNodeInfo          bool           `json:"log_node_info,omitempty"`
-	NodeHosts            []string       `json:"node_hosts,omitempty"`
-	NodePort             uint16         `json:"node_port,omitempty"`
-	NodeSNI              string         `json:"node_sni,omitempty"`
-	NodeInsecure         bool           `json:"node_insecure,omitempty"`
 
 	// OutboundsRaw declares named outbounds that users can reference by name.
 	// The name "direct" is reserved: it always resolves to the built-in direct
@@ -58,10 +52,9 @@ type ListenerWrapper struct {
 	logger           *zap.Logger
 	defaultSelection outboundSelection
 	userSelections   map[string]outboundSelection
-	active           int64
-	activeStreams    int64
-	connSeq          uint64
-	fallbackSet      bool
+	active           atomic.Int64
+	activeStreams    atomic.Int64
+	connSeq          atomic.Uint64
 	registry         *sessionRegistry
 	detector         passwordHashDetector
 	service          *singanytls.Service
@@ -93,6 +86,10 @@ func (*ListenerWrapper) CaddyModule() caddy.ModuleInfo {
 // Provision sets defaults and runtime dependencies.
 func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	lw.logger = ctx.Logger(lw)
+	if err := validateSNI(lw.SNI); err != nil {
+		return err
+	}
+	lw.SNI = strings.ToLower(lw.SNI)
 
 	if lw.ProbeTimeout == 0 {
 		lw.ProbeTimeout = caddy.Duration(5 * time.Second)
@@ -115,18 +112,8 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	if lw.MaxConcurrentStreams == 0 {
 		lw.MaxConcurrentStreams = 1024
 	}
-	if !lw.fallbackSet {
-		lw.Fallback = true
-	}
-	if lw.PaddingScheme == "" {
-		lw.PaddingScheme = string(padding.DefaultPaddingScheme)
-	}
 	if lw.registry == nil {
 		lw.registry = newSessionRegistry()
-	}
-	var server *caddyhttp.Server
-	if serverFromContext, ok := ctx.Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server); ok && serverFromContext != nil {
-		server = serverFromContext
 	}
 	if err := lw.provisionNamedOutbounds(ctx); err != nil {
 		return err
@@ -135,7 +122,7 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 	lw.detector = newPasswordHashDetector(lw.Users)
 
 	service, err := singanytls.NewService(singanytls.ServiceConfig{
-		PaddingScheme: []byte(lw.PaddingScheme),
+		PaddingScheme: []byte(padding.DefaultPaddingScheme),
 		Users:         lw.anyTLSUsers(),
 		Handler:       &proxyHandler{config: lw},
 		Logger:        zapLogger{base: lw.logger},
@@ -144,7 +131,6 @@ func (lw *ListenerWrapper) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("create sing-anytls service: %w", err)
 	}
 	lw.service = service
-	lw.logNodeInfo(server)
 
 	return nil
 }
@@ -219,12 +205,7 @@ func (lw *ListenerWrapper) outboundSelectionForUser(user string) outboundSelecti
 	return lw.defaultSelection
 }
 
-// Cleanup closes all active AnyTLS sessions when the config is unloaded.
-// This must be the module's own Cleanup: callbacks registered via
-// ctx.OnCancel inside Provision are appended to a copy of the caddy.Context
-// (value receiver) and never run in caddy v2.11.4. Note that caddy gives no
-// ordering guarantee across module cleanups, so outbound modules may be
-// cleaned up before or after this runs.
+// Cleanup closes active AnyTLS sessions when Caddy unloads this configuration.
 func (lw *ListenerWrapper) Cleanup() error {
 	if lw.registry != nil {
 		lw.closeActiveSessions()
@@ -234,6 +215,9 @@ func (lw *ListenerWrapper) Cleanup() error {
 
 // Validate checks static configuration safety.
 func (lw *ListenerWrapper) Validate() error {
+	if err := validateSNI(lw.SNI); err != nil {
+		return err
+	}
 	if lw.MaxConcurrent < 0 {
 		return fmt.Errorf("max_concurrent must be positive")
 	}
@@ -280,6 +264,7 @@ func (lw *ListenerWrapper) Validate() error {
 
 // WrapListener wraps the listener with AnyTLS-aware connection routing.
 func (lw *ListenerWrapper) WrapListener(l net.Listener) net.Listener {
+	lw.logNodeInfo(l.Addr())
 	return newWrappedListener(l, lw)
 }
 
@@ -315,36 +300,12 @@ func (lw *ListenerWrapper) logFallback(conn net.Conn, err error) {
 	)
 }
 
-func (lw *ListenerWrapper) prepareWebsiteConn(conn *bufferedConn) net.Conn {
-	if stater, ok := conn.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
-		return tlsStateConn{
-			Conn:  conn,
-			state: stater.ConnectionState(),
-		}
-	}
-
-	return conn
-}
-
-type tlsStateConn struct {
-	net.Conn
-	state tls.ConnectionState
-}
-
-func (c tlsStateConn) ConnectionState() tls.ConnectionState {
-	return c.state
-}
-
 var (
 	errInvalidDestination       = errors.New("invalid destination")
 	errInvalidUDPOverTCPRequest = errors.New("invalid udp over tcp request")
 	errUnsupportedUDPOverTCP    = errors.New("unsupported udp over tcp")
 	errStreamLimitExceeded      = errors.New("stream concurrency limit exceeded")
 )
-
-func (lw *ListenerWrapper) nextConnectionID() uint64 {
-	return atomic.AddUint64(&lw.connSeq, 1)
-}
 
 func probeFailureReason(err error) string {
 	switch {

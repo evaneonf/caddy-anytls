@@ -50,31 +50,13 @@ type contextDialer interface {
 // outbound. Its protocol bytes have only been peeked, not consumed.
 type OutboundSession struct {
 	conn           net.Conn
-	user           string
-	source         M.Socksaddr
 	connectTimeout time.Duration
 	serveLocal     func(StreamOutbound) error
-}
-
-func newOutboundSession(conn net.Conn, user string, source M.Socksaddr, connectTimeout time.Duration, serveLocal func(StreamOutbound) error) *OutboundSession {
-	return &OutboundSession{
-		conn:           conn,
-		user:           user,
-		source:         source,
-		connectTimeout: connectTimeout,
-		serveLocal:     serveLocal,
-	}
 }
 
 // Connection returns the decrypted AnyTLS protocol connection. Callers that
 // relay it must preserve all bytes after the 32-byte authentication hash.
 func (s *OutboundSession) Connection() net.Conn { return s.conn }
-
-// User returns the locally authenticated user name.
-func (s *OutboundSession) User() string { return s.user }
-
-// Source returns the client address observed by this server.
-func (s *OutboundSession) Source() M.Socksaddr { return s.source }
 
 // ConnectTimeout returns the configured timeout for establishing an outbound
 // connection. It does not limit the lifetime of an established session.

@@ -232,28 +232,16 @@ func (o *SOCKS5Outbound) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.NextBlock(0) {
 		switch d.Val() {
 		case "address":
-			if o.Address != "" || !d.NextArg() {
-				return d.ArgErr()
-			}
-			o.Address = d.Val()
-			if d.NextArg() {
-				return d.ArgErr()
+			if err := parseUniqueStringDirective(d, &o.Address); err != nil {
+				return err
 			}
 		case "username":
-			if o.Username != "" || !d.NextArg() {
-				return d.ArgErr()
-			}
-			o.Username = d.Val()
-			if d.NextArg() {
-				return d.ArgErr()
+			if err := parseUniqueStringDirective(d, &o.Username); err != nil {
+				return err
 			}
 		case "password":
-			if o.Password != "" || !d.NextArg() {
-				return d.ArgErr()
-			}
-			o.Password = d.Val()
-			if d.NextArg() {
-				return d.ArgErr()
+			if err := parseUniqueStringDirective(d, &o.Password); err != nil {
+				return err
 			}
 		default:
 			return d.Errf("unrecognized socks5 outbound option %q", d.Val())

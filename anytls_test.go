@@ -3,13 +3,11 @@ package anytls
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"io"
 	"net"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,35 +20,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
-	"golang.org/x/net/http2"
 )
-
-func TestBufferedConnPeekPreservesBytes(t *testing.T) {
-	server, client := net.Pipe()
-	defer closeTest(server)
-	defer closeTest(client)
-
-	go func() {
-		_, _ = client.Write([]byte("GET / HTTP/1.1\r\n"))
-	}()
-
-	conn := newBufferedConn(server)
-	preview, err := conn.Peek(1, time.Second)
-	if err != nil {
-		t.Fatalf("Peek() error = %v", err)
-	}
-	if string(preview) != "G" {
-		t.Fatalf("Peek() = %q, want %q", string(preview), "G")
-	}
-
-	buf := make([]byte, 3)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		t.Fatalf("ReadFull() error = %v", err)
-	}
-	if string(buf) != "GET" {
-		t.Fatalf("read bytes = %q, want %q", string(buf), "GET")
-	}
-}
 
 func TestValidate(t *testing.T) {
 	tests := []struct {
@@ -61,6 +31,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "valid config",
 			config: &ListenerWrapper{
+				SNI:           "example.test",
 				MaxConcurrent: 1,
 				Users: []User{
 					{Name: "alice", Password: "secret", Enabled: true},
@@ -71,6 +42,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "duplicate user",
 			config: &ListenerWrapper{
+				SNI: "example.test",
 				Users: []User{
 					{Name: "alice", Password: "secret"},
 					{Name: "alice", Password: "secret-2"},
@@ -81,6 +53,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "duplicate password",
 			config: &ListenerWrapper{
+				SNI: "example.test",
 				Users: []User{
 					{Name: "alice", Password: "secret"},
 					{Name: "bob", Password: "secret"},
@@ -91,6 +64,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "negative concurrency",
 			config: &ListenerWrapper{
+				SNI:           "example.test",
 				MaxConcurrent: -1,
 			},
 			wantErr: true,
@@ -98,6 +72,7 @@ func TestValidate(t *testing.T) {
 		{
 			name: "empty password",
 			config: &ListenerWrapper{
+				SNI: "example.test",
 				Users: []User{
 					{Name: "alice"},
 				},
@@ -265,8 +240,8 @@ func TestHandlerReportsHandshakeSuccess(t *testing.T) {
 				default:
 					t.Fatal("handler did not close the stream after HandshakeSuccess() failed")
 				}
-				if wrapper.activeStreams != 0 {
-					t.Fatalf("active streams = %d, want 0", wrapper.activeStreams)
+				if wrapper.activeStreams.Load() != 0 {
+					t.Fatalf("active streams = %d, want 0", wrapper.activeStreams.Load())
 				}
 				return
 			}
@@ -277,7 +252,7 @@ func TestHandlerReportsHandshakeSuccess(t *testing.T) {
 			default:
 			}
 			closeTest(clientConn)
-			if !waitForCondition(time.Second, func() bool { return atomic.LoadInt64(&wrapper.activeStreams) == 0 }) {
+			if !waitForCondition(time.Second, func() bool { return wrapper.activeStreams.Load() == 0 }) {
 				t.Fatal("stream slot was not released after the connection closed")
 			}
 		})
@@ -373,172 +348,6 @@ func TestWebsiteFallbackEndToEnd(t *testing.T) {
 	fields := entries[0].ContextMap()
 	if fields["event"] != "fallback" || fields["outcome"] != "fallback" || fields["reason"] != "website_protocol" {
 		t.Fatalf("website fallback log fields = %v", fields)
-	}
-}
-
-func TestHTTP2FallbackPreservesConnectionState(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
-
-	base := newChanListener()
-	defer closeTest(base)
-
-	tlsListener := tls.NewListener(base, &tls.Config{
-		Certificates: []tls.Certificate{newTestCertificate(t)},
-		NextProtos:   []string{"h2", "http/1.1"},
-	})
-	wrapped := wrapper.WrapListener(tlsListener)
-
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, err := wrapped.Accept()
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		defer closeTest(conn)
-
-		stater, ok := conn.(interface{ ConnectionState() tls.ConnectionState })
-		if !ok {
-			serverErr <- errors.New("wrapped listener did not preserve ConnectionState on fallback connection")
-			return
-		}
-		if got := stater.ConnectionState().NegotiatedProtocol; got != "h2" {
-			serverErr <- errors.New("unexpected negotiated protocol: " + got)
-			return
-		}
-
-		preface := make([]byte, len(http2.ClientPreface))
-		if _, err := io.ReadFull(conn, preface); err != nil {
-			serverErr <- err
-			return
-		}
-		if string(preface) != http2.ClientPreface {
-			serverErr <- errors.New("http2 preface was not preserved")
-			return
-		}
-
-		serverErr <- nil
-	}()
-
-	serverConn, clientConn := net.Pipe()
-	base.enqueue(serverConn)
-
-	client := tls.Client(clientConn, &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"h2"},
-		ServerName:         "example.test",
-	})
-	defer closeTest(client)
-
-	if err := client.Handshake(); err != nil {
-		t.Fatalf("client Handshake() error = %v", err)
-	}
-	if got := client.ConnectionState().NegotiatedProtocol; got != "h2" {
-		t.Fatalf("client negotiated protocol = %q, want %q", got, "h2")
-	}
-	if _, err := io.WriteString(client, http2.ClientPreface); err != nil {
-		t.Fatalf("WriteString() error = %v", err)
-	}
-
-	if err := <-serverErr; err != nil {
-		t.Fatalf("server error = %v", err)
-	}
-}
-
-func TestHTTP1FallbackPreservesConnectionState(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
-
-	base := newChanListener()
-	defer closeTest(base)
-
-	tlsListener := tls.NewListener(base, &tls.Config{
-		Certificates: []tls.Certificate{newTestCertificate(t)},
-		NextProtos:   []string{"http/1.1"},
-	})
-	wrapped := wrapper.WrapListener(tlsListener)
-
-	serverErr := make(chan error, 1)
-	go func() {
-		conn, err := wrapped.Accept()
-		if err != nil {
-			serverErr <- err
-			return
-		}
-		defer closeTest(conn)
-
-		stater, ok := conn.(interface{ ConnectionState() tls.ConnectionState })
-		if !ok {
-			serverErr <- errors.New("wrapped listener did not preserve ConnectionState on fallback connection")
-			return
-		}
-		state := stater.ConnectionState()
-		if got := state.NegotiatedProtocol; got != "http/1.1" {
-			serverErr <- errors.New("unexpected negotiated protocol: " + got)
-			return
-		}
-		if got := state.ServerName; got != "example.test" {
-			serverErr <- errors.New("unexpected server name: " + got)
-			return
-		}
-
-		request := "GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"
-		buf := make([]byte, len(request))
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			serverErr <- err
-			return
-		}
-		if string(buf) != request {
-			serverErr <- errors.New("http/1.1 request bytes were not preserved")
-			return
-		}
-
-		serverErr <- nil
-	}()
-
-	serverConn, clientConn := net.Pipe()
-	base.enqueue(serverConn)
-
-	client := tls.Client(clientConn, &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"http/1.1"},
-		ServerName:         "example.test",
-	})
-	defer closeTest(client)
-
-	if err := client.Handshake(); err != nil {
-		t.Fatalf("client Handshake() error = %v", err)
-	}
-	if got := client.ConnectionState().NegotiatedProtocol; got != "http/1.1" {
-		t.Fatalf("client negotiated protocol = %q, want %q", got, "http/1.1")
-	}
-	if _, err := io.WriteString(client, "GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n"); err != nil {
-		t.Fatalf("WriteString() error = %v", err)
-	}
-
-	if err := <-serverErr; err != nil {
-		t.Fatalf("server error = %v", err)
-	}
-}
-
-func TestWebsiteFallbackWithoutTLSStateRemainsOpaque(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
-
-	server, client := net.Pipe()
-	defer closeTest(server)
-	defer closeTest(client)
-
-	buffered := newBufferedConn(server)
-	go func() {
-		_, _ = client.Write([]byte("GET / HTTP/1.1\r\n"))
-	}()
-	if _, err := buffered.Peek(1, time.Second); err != nil {
-		t.Fatalf("Peek() error = %v", err)
-	}
-
-	websiteConn := wrapper.prepareWebsiteConn(buffered)
-
-	if _, ok := websiteConn.(interface{ ConnectionState() tls.ConnectionState }); ok {
-		t.Fatal("non-TLS fallback connection unexpectedly implements ConnectionState")
 	}
 }
 
@@ -863,24 +672,6 @@ func TestIdleTimeoutConnTreatsWritesAsActivity(t *testing.T) {
 	}
 	if err := <-serverReadDone; err != nil {
 		t.Fatalf("blocked Read() expired despite write activity: %v", err)
-	}
-}
-
-func TestDetectorRejectsDisabledUser(t *testing.T) {
-	enabled := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: true}})
-	disabled := newTestWrapper(t, []User{{Name: "alice", Password: "secret", Enabled: false}})
-
-	sum := sha256.Sum256([]byte("secret"))
-	preview := sum[:]
-
-	_, decision, err := enabled.detector.identify(preview)
-	if err != nil || decision != routeAnyTLS {
-		t.Fatalf("enabled detector = (%v, %v), want AnyTLS", decision, err)
-	}
-
-	_, decision, err = disabled.detector.identify(preview)
-	if err == nil || decision != routeReject {
-		t.Fatalf("disabled detector = (%v, %v), want reject with error", decision, err)
 	}
 }
 

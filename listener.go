@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,7 +79,7 @@ func (wl *wrappedListener) acceptLoop() {
 
 func (wl *wrappedListener) processAcceptedConn(conn net.Conn) {
 	defer func() { <-wl.probeSlots }()
-	connectionID := wl.config.nextConnectionID()
+	connectionID := wl.config.connSeq.Add(1)
 
 	websiteConn, err := wl.classifyAcceptedConn(conn, connectionID)
 	if err != nil {
@@ -119,6 +120,21 @@ func (wl *wrappedListener) classifyAcceptedConn(conn net.Conn, connectionID uint
 		}
 	}
 
+	var state tls.ConnectionState
+	if stater, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		state = stater.ConnectionState()
+	}
+	if !state.HandshakeComplete || !strings.EqualFold(state.ServerName, wl.config.SNI) {
+		wl.config.logger.Debug("connection routed to website",
+			zap.Uint64("connection_id", connectionID),
+			zap.String("event", "fallback"),
+			zap.String("outcome", "fallback"),
+			zap.String("reason", "sni_mismatch"),
+			zap.String("sni", state.ServerName),
+		)
+		return conn, nil
+	}
+
 	buffered := newBufferedConn(conn)
 	return wl.routeBufferedConn(conn, buffered, connectionID)
 }
@@ -145,9 +161,9 @@ func (wl *wrappedListener) routeBufferedConn(rawConn net.Conn, buffered *buffere
 	route, detectErr := wl.classifyBufferedConn(buffered)
 	decision := route.decision
 	if detectErr != nil {
-		if decision == routeFallback && wl.config.Fallback {
+		if decision == routeFallback {
 			wl.config.logFallback(rawConn, detectErr)
-			return wl.config.prepareWebsiteConn(buffered), nil
+			return prepareWebsiteConn(buffered), nil
 		}
 		wl.config.logger.Warn("connection rejected during anytls probe",
 			zap.Uint64("connection_id", connectionID),
@@ -170,7 +186,7 @@ func (wl *wrappedListener) routeBufferedConn(rawConn net.Conn, buffered *buffere
 			zap.String("outcome", "fallback"),
 			zap.String("reason", "website_protocol"),
 		)
-		return wl.config.prepareWebsiteConn(buffered), nil
+		return prepareWebsiteConn(buffered), nil
 	case routeAnyTLS:
 		if !wl.config.acquire() {
 			wl.config.logger.Warn("rejecting AnyTLS connection due to concurrency limit",
@@ -354,10 +370,14 @@ func (wl *wrappedListener) serveAnyTLS(buffered *bufferedConn, connectionID uint
 			zap.Duration("duration", duration),
 		)
 	}
-	session := newOutboundSession(conn, user, source, time.Duration(wl.config.ConnectTimeout), func(streamOutbound StreamOutbound) error {
-		selectedCtx := contextWithStreamOutbound(ctx, selection.name, streamOutbound)
-		return wl.config.service.NewConnection(selectedCtx, conn, source, onClose)
-	})
+	session := &OutboundSession{
+		conn:           conn,
+		connectTimeout: time.Duration(wl.config.ConnectTimeout),
+		serveLocal: func(streamOutbound StreamOutbound) error {
+			selectedCtx := contextWithStreamOutbound(ctx, selection.name, streamOutbound)
+			return wl.config.service.NewConnection(selectedCtx, conn, source, onClose)
+		},
+	}
 	err := selection.outbound.HandleSession(ctx, session)
 	if err != nil && !errors.Is(err, io.EOF) {
 		wl.config.logger.Debug("anytls session finished",

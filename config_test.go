@@ -2,7 +2,6 @@ package anytls
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"strings"
@@ -13,7 +12,6 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	_ "github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-	"go.uber.org/zap"
 )
 
 func TestCaddyfileExamplesAreFormatted(t *testing.T) {
@@ -69,12 +67,8 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 		max_pending_probes 96
 		max_streams_per_session 48
 		max_concurrent_streams 512
-		fallback true
 		log_node_info true
-		node_host example.com alt.example.com
-		node_port 8443
-		node_sni real.example.com
-		node_insecure true
+		sni real.example.com
 		user alice secret
 	}
 	`)
@@ -105,23 +99,11 @@ func TestUnmarshalCaddyfile(t *testing.T) {
 	if wrapper.MaxConcurrentStreams != 512 {
 		t.Fatalf("MaxConcurrentStreams = %d, want %d", wrapper.MaxConcurrentStreams, 512)
 	}
-	if !wrapper.Fallback {
-		t.Fatal("Fallback = false, want true")
-	}
 	if !wrapper.LogNodeInfo {
 		t.Fatal("LogNodeInfo = false, want true")
 	}
-	if strings.Join(wrapper.NodeHosts, ",") != "example.com,alt.example.com" {
-		t.Fatalf("NodeHosts = %v, want example.com and alt.example.com", wrapper.NodeHosts)
-	}
-	if wrapper.NodePort != 8443 {
-		t.Fatalf("NodePort = %d, want 8443", wrapper.NodePort)
-	}
-	if wrapper.NodeSNI != "real.example.com" {
-		t.Fatalf("NodeSNI = %q, want real.example.com", wrapper.NodeSNI)
-	}
-	if !wrapper.NodeInsecure {
-		t.Fatal("NodeInsecure = false, want true")
+	if wrapper.SNI != "real.example.com" {
+		t.Fatalf("SNI = %q, want real.example.com", wrapper.SNI)
 	}
 	if len(wrapper.Users) != 1 || wrapper.Users[0].Name != "alice" || wrapper.Users[0].Password != "secret" || !wrapper.Users[0].Enabled {
 		t.Fatalf("Users = %#v, want one enabled user", wrapper.Users)
@@ -135,47 +117,21 @@ func TestUnmarshalCaddyfileRejectsExtraScalarArguments(t *testing.T) {
 	}
 }
 
-func TestUnmarshalCaddyfileAllowsFallbackFalse(t *testing.T) {
-	dispenser := caddyfile.NewTestDispenser(`
-	anytls {
-		fallback false
-		user alice secret
-	}
-	`)
-
-	var wrapper ListenerWrapper
-	if err := wrapper.UnmarshalCaddyfile(dispenser); err != nil {
-		t.Fatalf("UnmarshalCaddyfile() error = %v", err)
-	}
-	wrapper.logger = zap.NewNop()
-	wrapper.registry = newSessionRegistry()
-	if err := wrapper.Provision(caddy.Context{Context: context.Background()}); err != nil {
-		t.Fatalf("Provision() error = %v", err)
-	}
-
-	if wrapper.Fallback {
-		t.Fatal("Fallback = true, want false")
-	}
-}
-
 func TestUnmarshalJSONDefaults(t *testing.T) {
 	tests := []struct {
-		name         string
-		input        string
-		wantFallback bool
-		wantEnabled  bool
+		name        string
+		input       string
+		wantEnabled bool
 	}{
 		{
-			name:         "omitted booleans use documented defaults",
-			input:        `{"users":[{"name":"alice","password":"secret"}]}`,
-			wantFallback: true,
-			wantEnabled:  true,
+			name:        "omitted booleans use documented defaults",
+			input:       `{"users":[{"name":"alice","password":"secret"}]}`,
+			wantEnabled: true,
 		},
 		{
-			name:         "explicit false values are preserved",
-			input:        `{"fallback":false,"users":[{"name":"alice","password":"secret","enabled":false}]}`,
-			wantFallback: false,
-			wantEnabled:  false,
+			name:        "explicit false values are preserved",
+			input:       `{"users":[{"name":"alice","password":"secret","enabled":false}]}`,
+			wantEnabled: false,
 		},
 	}
 
@@ -184,9 +140,6 @@ func TestUnmarshalJSONDefaults(t *testing.T) {
 			var wrapper ListenerWrapper
 			if err := json.Unmarshal([]byte(tt.input), &wrapper); err != nil {
 				t.Fatalf("json.Unmarshal() error = %v", err)
-			}
-			if wrapper.Fallback != tt.wantFallback {
-				t.Fatalf("Fallback = %v, want %v", wrapper.Fallback, tt.wantFallback)
 			}
 			if len(wrapper.Users) != 1 {
 				t.Fatalf("len(Users) = %d, want 1", len(wrapper.Users))
@@ -200,8 +153,7 @@ func TestUnmarshalJSONDefaults(t *testing.T) {
 
 func TestUnmarshalJSONRejectsNullBooleans(t *testing.T) {
 	for name, input := range map[string]string{
-		"fallback": `{"fallback":null,"users":[{"name":"alice","password":"secret"}]}`,
-		"enabled":  `{"users":[{"name":"alice","password":"secret","enabled":null}]}`,
+		"enabled": `{"users":[{"name":"alice","password":"secret","enabled":null}]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			var wrapper ListenerWrapper
@@ -237,17 +189,6 @@ func TestUnmarshalJSONRejectsUnknownFields(t *testing.T) {
 	}
 }
 
-func TestUnmarshalJSONRejectsUnnamedOutbound(t *testing.T) {
-	var wrapper ListenerWrapper
-	err := json.Unmarshal([]byte(`{
-		"users": [{"name": "alice", "password": "secret"}],
-		"outbound": {"dialer": "socks5", "address": "127.0.0.1:1080"}
-	}`), &wrapper)
-	if err == nil || !strings.Contains(err.Error(), `field "outbound" is not supported`) {
-		t.Fatalf("json.Unmarshal() error = %v, want unnamed outbound rejection", err)
-	}
-}
-
 func TestCaddyfileAdapterIncludesAnyTLSListenerWrapper(t *testing.T) {
 	adapter := caddyconfig.GetAdapter("caddyfile")
 	if adapter == nil {
@@ -259,11 +200,11 @@ func TestCaddyfileAdapterIncludesAnyTLSListenerWrapper(t *testing.T) {
 	servers :443 {
 		listener_wrappers {
 			anytls {
+				sni example.com
 				probe_timeout 5s
 				idle_timeout 2m
 				connect_timeout 10s
 				max_concurrent 64
-				fallback true
 				user alice secret
 			}
 		}

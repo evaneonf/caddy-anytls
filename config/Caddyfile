@@ -4,7 +4,7 @@
 			anytls {
 				user device-1 change-this-password
 				log_node_info false
-				node_host example.com
+				sni example.com
 			}
 		}
 	}

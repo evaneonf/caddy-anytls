@@ -7,13 +7,11 @@ import (
 	"io"
 	"net"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	M "github.com/sagernet/sing/common/metadata"
 )
 
 func TestAnyTLSOutboundRelaysSessionAndRewritesPassword(t *testing.T) {
@@ -66,13 +64,8 @@ func TestAnyTLSOutboundRelaysSessionAndRewritesPassword(t *testing.T) {
 		closeTest(serverConn)
 		closeTest(clientConn)
 	})
-	session := newOutboundSession(
-		serverConn,
-		"alice",
-		M.ParseSocksaddr("192.0.2.10:12345"),
-		time.Second,
-		nil,
-	)
+	session := &OutboundSession{conn: serverConn, connectTimeout: time.Second}
+
 	relayErr := make(chan error, 1)
 	go func() { relayErr <- outbound.HandleSession(t.Context(), session) }()
 
@@ -177,80 +170,5 @@ func TestProvisionLoadsNamedAnyTLSOutbound(t *testing.T) {
 	}
 	if outbound.tlsConfig.ServerName != "upstream.example.com" {
 		t.Fatalf("TLS server name = %q, want upstream.example.com", outbound.tlsConfig.ServerName)
-	}
-}
-
-type capturedOutboundSession struct {
-	user   string
-	source M.Socksaddr
-}
-
-type captureSessionOutbound struct {
-	sessions chan capturedOutboundSession
-}
-
-func (o *captureSessionOutbound) HandleSession(_ context.Context, session *OutboundSession) error {
-	o.sessions <- capturedOutboundSession{user: session.User(), source: session.Source()}
-	return nil
-}
-
-type remoteAddrConn struct {
-	net.Conn
-	remote net.Addr
-}
-
-func (c *remoteAddrConn) RemoteAddr() net.Addr { return c.remote }
-
-func TestListenerRoutesDetectedUserToSessionOutbound(t *testing.T) {
-	wrapper := newTestWrapper(t, []User{{Name: "alice", Password: "local-secret", Enabled: true}})
-	capture := &captureSessionOutbound{sessions: make(chan capturedOutboundSession, 1)}
-	wrapper.userSelections = map[string]outboundSelection{
-		"alice": {outbound: capture, name: "relay"},
-	}
-
-	serverSide, clientSide := net.Pipe()
-	defer closeTest(serverSide)
-	defer closeTest(clientSide)
-	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 12345}
-	serverConn := &remoteAddrConn{Conn: serverSide, remote: remote}
-	buffered := newBufferedConn(serverConn)
-
-	type routeResult struct {
-		website net.Conn
-		err     error
-	}
-	routed := make(chan routeResult, 1)
-	go func() {
-		website, err := (&wrappedListener{config: wrapper}).routeBufferedConn(serverConn, buffered, 1)
-		routed <- routeResult{website: website, err: err}
-	}()
-
-	passwordHash := sha256.Sum256([]byte("local-secret"))
-	if _, err := clientSide.Write(passwordHash[:]); err != nil {
-		t.Fatalf("client Write() error = %v", err)
-	}
-	result := <-routed
-	if result.err != nil {
-		t.Fatalf("routeBufferedConn() error = %v", result.err)
-	}
-	if result.website != nil {
-		t.Fatal("detected AnyTLS connection was routed to the website")
-	}
-
-	select {
-	case session := <-capture.sessions:
-		if session.user != "alice" {
-			t.Fatalf("session user = %q, want alice", session.user)
-		}
-		wantSource := M.SocksaddrFromNet(remote)
-		if session.source != wantSource {
-			t.Fatalf("session source = %s, want %s", session.source, wantSource)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("selected session outbound was not called")
-	}
-
-	if !waitForCondition(time.Second, func() bool { return atomic.LoadInt64(&wrapper.active) == 0 }) {
-		t.Fatalf("active AnyTLS sessions = %d, want 0", atomic.LoadInt64(&wrapper.active))
 	}
 }

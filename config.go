@@ -3,7 +3,6 @@ package anytls
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -71,21 +70,6 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			lw.MaxConcurrentStreams = value
 
-		case "fallback":
-			value, err := parseBoolDirective(d, "fallback")
-			if err != nil {
-				return err
-			}
-			lw.Fallback = value
-			lw.fallbackSet = true
-
-		case "padding_scheme":
-			value, err := parseStringDirective(d)
-			if err != nil {
-				return err
-			}
-			lw.PaddingScheme = value
-
 		case "log_node_info":
 			value, err := parseBoolDirective(d, "log_node_info")
 			if err != nil {
@@ -93,33 +77,15 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			lw.LogNodeInfo = value
 
-		case "node_host":
-			values := d.RemainingArgs()
-			if len(values) == 0 {
-				return d.ArgErr()
-			}
-			lw.NodeHosts = append(lw.NodeHosts, values...)
-
-		case "node_port":
-			value, err := parsePortDirective(d, "node_port")
-			if err != nil {
-				return err
-			}
-			lw.NodePort = value
-
-		case "node_sni":
+		case "sni":
 			value, err := parseStringDirective(d)
 			if err != nil {
 				return err
 			}
-			lw.NodeSNI = value
-
-		case "node_insecure":
-			value, err := parseBoolDirective(d, "node_insecure")
-			if err != nil {
-				return err
+			if value == "" {
+				return d.Err("sni must not be empty")
 			}
-			lw.NodeInsecure = value
+			lw.SNI = value
 
 		case "user":
 			args := d.RemainingArgs()
@@ -198,59 +164,10 @@ func unmarshalOutboundModule(d *caddyfile.Dispenser, moduleName string) (json.Ra
 	return caddyconfig.JSONModuleObject(unm, "dialer", moduleName, nil), nil
 }
 
-// UnmarshalJSON preserves explicit false values for booleans with non-zero
-// defaults and applies the documented enabled-by-default user behavior.
+// UnmarshalJSON rejects unsupported configuration fields and decodes users.
 func (lw *ListenerWrapper) UnmarshalJSON(data []byte) error {
-	var config struct {
-		Users                []User                     `json:"users,omitempty"`
-		ProbeTimeout         caddy.Duration             `json:"probe_timeout,omitempty"`
-		IdleTimeout          caddy.Duration             `json:"idle_timeout,omitempty"`
-		ConnectTimeout       caddy.Duration             `json:"connect_timeout,omitempty"`
-		MaxConcurrent        int                        `json:"max_concurrent,omitempty"`
-		MaxPendingProbes     int                        `json:"max_pending_probes,omitempty"`
-		MaxStreamsPerSession int                        `json:"max_streams_per_session,omitempty"`
-		MaxConcurrentStreams int                        `json:"max_concurrent_streams,omitempty"`
-		Fallback             json.RawMessage            `json:"fallback"`
-		PaddingScheme        string                     `json:"padding_scheme,omitempty"`
-		LogNodeInfo          bool                       `json:"log_node_info,omitempty"`
-		NodeHosts            []string                   `json:"node_hosts,omitempty"`
-		NodePort             uint16                     `json:"node_port,omitempty"`
-		NodeSNI              string                     `json:"node_sni,omitempty"`
-		NodeInsecure         bool                       `json:"node_insecure,omitempty"`
-		OutboundsRaw         map[string]json.RawMessage `json:"outbounds,omitempty"`
-		DefaultOutbound      string                     `json:"default_outbound,omitempty"`
-		UnnamedOutbound      json.RawMessage            `json:"outbound"`
-	}
-	if err := caddy.StrictUnmarshalJSON(data, &config); err != nil {
-		return err
-	}
-	fallback, fallbackSet, err := unmarshalDefaultTrueBool(config.Fallback, "fallback")
-	if err != nil {
-		return err
-	}
-	lw.Users = config.Users
-	lw.ProbeTimeout = config.ProbeTimeout
-	lw.IdleTimeout = config.IdleTimeout
-	lw.ConnectTimeout = config.ConnectTimeout
-	lw.MaxConcurrent = config.MaxConcurrent
-	lw.MaxPendingProbes = config.MaxPendingProbes
-	lw.MaxStreamsPerSession = config.MaxStreamsPerSession
-	lw.MaxConcurrentStreams = config.MaxConcurrentStreams
-	lw.Fallback = fallback
-	lw.fallbackSet = fallbackSet
-	lw.PaddingScheme = config.PaddingScheme
-	lw.LogNodeInfo = config.LogNodeInfo
-	lw.NodeHosts = config.NodeHosts
-	lw.NodePort = config.NodePort
-	lw.NodeSNI = config.NodeSNI
-	lw.NodeInsecure = config.NodeInsecure
-	lw.OutboundsRaw = config.OutboundsRaw
-	lw.DefaultOutbound = config.DefaultOutbound
-	if config.UnnamedOutbound != nil {
-		return errors.New("JSON field \"outbound\" is not supported; declare a named entry in \"outbounds\" and select it with \"default_outbound\"")
-	}
-
-	return nil
+	type config ListenerWrapper
+	return caddy.StrictUnmarshalJSON(data, (*config)(lw))
 }
 
 // UnmarshalJSON makes JSON users enabled by default while still allowing
@@ -264,7 +181,7 @@ func (u *User) UnmarshalJSON(data []byte) error {
 	if err := caddy.StrictUnmarshalJSON(data, &raw); err != nil {
 		return err
 	}
-	enabled, _, err := unmarshalDefaultTrueBool(raw.Enabled, "enabled")
+	enabled, err := unmarshalDefaultTrueBool(raw.Enabled, "enabled")
 	if err != nil {
 		return err
 	}
@@ -273,17 +190,17 @@ func (u *User) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func unmarshalDefaultTrueBool(raw json.RawMessage, field string) (value bool, set bool, err error) {
+func unmarshalDefaultTrueBool(raw json.RawMessage, field string) (value bool, err error) {
 	if raw == nil {
-		return true, false, nil
+		return true, nil
 	}
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return false, false, fmt.Errorf("JSON field %q must not be null", field)
+		return false, fmt.Errorf("JSON field %q must not be null", field)
 	}
 	if err := json.Unmarshal(raw, &value); err != nil {
-		return false, false, fmt.Errorf("JSON field %q must be a boolean: %w", field, err)
+		return false, fmt.Errorf("JSON field %q must be a boolean: %w", field, err)
 	}
-	return value, true, nil
+	return value, nil
 }
 
 func parseDurationDirective(d *caddyfile.Dispenser, name string) (time.Duration, error) {
@@ -322,18 +239,6 @@ func parseIntDirective(d *caddyfile.Dispenser, name string) (int, error) {
 	return value, nil
 }
 
-func parsePortDirective(d *caddyfile.Dispenser, name string) (uint16, error) {
-	rawValue, err := parseStringDirective(d)
-	if err != nil {
-		return 0, err
-	}
-	value, err := strconv.ParseUint(rawValue, 10, 16)
-	if err != nil || value == 0 {
-		return 0, d.Errf("parsing %s port %q: must be between 1 and 65535", name, rawValue)
-	}
-	return uint16(value), nil
-}
-
 func parseStringDirective(d *caddyfile.Dispenser) (string, error) {
 	if !d.NextArg() {
 		return "", d.ArgErr()
@@ -343,4 +248,17 @@ func parseStringDirective(d *caddyfile.Dispenser) (string, error) {
 		return "", d.ArgErr()
 	}
 	return value, nil
+}
+
+// parseUniqueStringDirective reads an outbound option that may be set once.
+func parseUniqueStringDirective(d *caddyfile.Dispenser, target *string) error {
+	if *target != "" {
+		return d.ArgErr()
+	}
+	value, err := parseStringDirective(d)
+	if err != nil {
+		return err
+	}
+	*target = value
+	return nil
 }

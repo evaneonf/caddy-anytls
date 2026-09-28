@@ -2,6 +2,7 @@ package anytls
 
 import (
 	"context"
+	"maps"
 	"net"
 	"sync"
 	"time"
@@ -69,31 +70,19 @@ func (lw *ListenerWrapper) releaseSessionStream(connectionID uint64) {
 
 func (lw *ListenerWrapper) closeActiveSessions() {
 	lw.registry.mu.Lock()
-	snapshots := make([]struct {
-		connectionID uint64
-		session      *activeSession
-	}, 0, len(lw.registry.sessions))
-	for connectionID, session := range lw.registry.sessions {
-		snapshots = append(snapshots, struct {
-			connectionID uint64
-			session      *activeSession
-		}{
-			connectionID: connectionID,
-			session:      session,
-		})
-	}
+	sessions := maps.Clone(lw.registry.sessions)
 	lw.registry.mu.Unlock()
 
-	for _, item := range snapshots {
-		item.session.cancel()
-		_ = item.session.conn.Close()
+	for connectionID, session := range sessions {
+		session.cancel()
+		_ = session.conn.Close()
 		lw.logger.Info("anytls session terminated",
-			zap.Uint64("connection_id", item.connectionID),
+			zap.Uint64("connection_id", connectionID),
 			zap.String("event", "anytls_session"),
 			zap.String("outcome", "terminated"),
 			zap.String("reason", "config_unload"),
-			zap.String("user", item.session.user),
-			zap.Duration("duration", time.Since(item.session.startedAt)),
+			zap.String("user", session.user),
+			zap.Duration("duration", time.Since(session.startedAt)),
 		)
 	}
 }
