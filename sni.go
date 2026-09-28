@@ -26,7 +26,9 @@ func validateSNI(name string) error {
 			return invalid()
 		}
 		for _, c := range label {
-			if c != '-' && !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') {
+			switch {
+			case c == '-', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			default:
 				return invalid()
 			}
 		}

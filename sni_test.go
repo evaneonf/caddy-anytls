@@ -69,8 +69,8 @@ func TestSNIRoutingAfterTLSHandshake(t *testing.T) {
 			capture := &captureSessionOutbound{sessions: make(chan struct{}, 1)}
 			wrapper.userSelections = map[string]outboundSelection{"alice": {outbound: capture, name: "capture"}}
 			serverRaw, clientRaw := net.Pipe()
-			defer serverRaw.Close()
-			defer clientRaw.Close()
+			defer func() { _ = serverRaw.Close() }()
+			defer func() { _ = clientRaw.Close() }()
 			_ = serverRaw.SetDeadline(time.Now().Add(10 * time.Second))
 			_ = clientRaw.SetDeadline(time.Now().Add(10 * time.Second))
 			server := tls.Server(serverRaw, &tls.Config{Certificates: []tls.Certificate{certificate}, NextProtos: []string{"h2", "http/1.1"}})
@@ -168,8 +168,8 @@ func TestSNIWithoutTLSStateBypassesProbe(t *testing.T) {
 	wrapper := newTestWrapper(t, nil)
 	wrapper.SNI = "proxy.example.com"
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
 	// No peer write: routing must return without trying to read the password.
 	conn, err := (&wrappedListener{config: wrapper}).classifyAcceptedConn(server, 1)
 	if err != nil || conn != server {
